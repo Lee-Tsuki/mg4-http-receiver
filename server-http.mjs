@@ -10,8 +10,6 @@ import { createClient } from "@supabase/supabase-js";
 
 const HTTP_HOST = "0.0.0.0";
 
-// Render gives the application process.env.PORT.
-// Locally it will still use HTTP_PORT or 3001.
 const HTTP_PORT = Number(
   process.env.PORT ||
   process.env.HTTP_PORT ||
@@ -22,8 +20,6 @@ const LOCAL_IP =
   process.env.LOCAL_IP ||
   "192.168.2.183";
 
-// When hosted, PUBLIC_URL can be set manually.
-// RENDER_EXTERNAL_URL is also supported if available.
 const DISPLAY_ENDPOINT =
   process.env.PUBLIC_URL ||
   process.env.RENDER_EXTERNAL_URL ||
@@ -33,7 +29,6 @@ const TENANT_KEY =
   process.env.TENANT_KEY ||
   "test-shelter";
 
-// Only accept your tracking beacon prefixes.
 const BEACON_PREFIXES = (
   process.env.AUTO_BEACON_PREFIXES ||
   "c30000"
@@ -55,12 +50,16 @@ const DEVICE_CACHE_TTL_MS =
     )
   );
 
-// Local CMD dashboard refresh only.
+// Dashboard only.
 // Does NOT affect MG4 sampling.
 const DASHBOARD_REFRESH_MS = 250;
 
 const GATEWAY_STALE_MS = 5000;
 const BEACON_STALE_MS = 5000;
+
+// Packet diagnostics
+const PACKET_HISTORY_MS = 60000;
+const PACKET_RATE_WINDOW_MS = 5000;
 
 // ============================================================
 // SUPABASE
@@ -116,7 +115,11 @@ const liveState = {
 
   lastError: null,
 
-  gateways: new Map()
+  gateways: new Map(),
+
+  // Actual HTTP arrival timing
+  packetTiming:
+    new Map()
 };
 
 // ============================================================
@@ -179,6 +182,26 @@ function median(values) {
   ) / 2;
 }
 
+function average(values) {
+  const clean =
+    values.filter(
+      Number.isFinite
+    );
+
+  if (!clean.length) {
+    return null;
+  }
+
+  return (
+    clean.reduce(
+      (sum, value) =>
+        sum + value,
+      0
+    ) /
+    clean.length
+  );
+}
+
 function formatAge(timestamp) {
   if (!timestamp) {
     return "-";
@@ -192,6 +215,18 @@ function formatAge(timestamp) {
   }
 
   return `${(age / 1000).toFixed(1)}s`;
+}
+
+function formatDuration(ms) {
+  if (!Number.isFinite(ms)) {
+    return "-";
+  }
+
+  if (ms < 1000) {
+    return `${Math.round(ms)}ms`;
+  }
+
+  return `${(ms / 1000).toFixed(2)}s`;
 }
 
 function formatClock(timestamp) {
@@ -240,6 +275,215 @@ function setError(error) {
       error ||
       "Unknown error"
     );
+}
+
+// ============================================================
+// HTTP PACKET TIMING
+// ============================================================
+//
+// This measures when the Node server ACTUALLY receives
+// each HTTP POST from each MG4.
+//
+// This measurement occurs BEFORE Supabase work,
+// so Supabase cannot influence this timing.
+// ============================================================
+
+function recordPacketArrival(
+  gatewayMac,
+  receivedAt = Date.now()
+) {
+  if (
+    !liveState.packetTiming.has(
+      gatewayMac
+    )
+  ) {
+    liveState.packetTiming.set(
+      gatewayMac,
+      {
+        firstAt:
+          receivedAt,
+
+        lastAt:
+          null,
+
+        arrivals: [],
+
+        intervals: []
+      }
+    );
+  }
+
+  const timing =
+    liveState.packetTiming.get(
+      gatewayMac
+    );
+
+  let intervalMs =
+    null;
+
+  if (
+    Number.isFinite(
+      timing.lastAt
+    )
+  ) {
+    intervalMs =
+      receivedAt -
+      timing.lastAt;
+
+    timing.intervals.push({
+      at:
+        receivedAt,
+
+      ms:
+        intervalMs
+    });
+  }
+
+  timing.lastAt =
+    receivedAt;
+
+  timing.arrivals.push(
+    receivedAt
+  );
+
+  const historyCutoff =
+    receivedAt -
+    PACKET_HISTORY_MS;
+
+  timing.arrivals =
+    timing.arrivals.filter(
+      timestamp =>
+        timestamp >=
+        historyCutoff
+    );
+
+  timing.intervals =
+    timing.intervals.filter(
+      item =>
+        item.at >=
+        historyCutoff
+    );
+
+  return intervalMs;
+}
+
+function getPacketMetrics(
+  gatewayMac,
+  now = Date.now()
+) {
+  const timing =
+    liveState.packetTiming.get(
+      gatewayMac
+    );
+
+  if (!timing) {
+    return {
+      rate5s: 0,
+      lastInterval: null,
+      avgInterval: null,
+      minInterval: null,
+      maxInterval: null,
+      packets60s: 0
+    };
+  }
+
+  const rateCutoff =
+    now -
+    PACKET_RATE_WINDOW_MS;
+
+  const packets5s =
+    timing.arrivals.filter(
+      timestamp =>
+        timestamp >=
+        rateCutoff
+    ).length;
+
+  const recentIntervals =
+    timing.intervals
+      .filter(
+        item =>
+          item.at >=
+          now -
+          PACKET_HISTORY_MS
+      )
+      .map(
+        item =>
+          item.ms
+      )
+      .filter(
+        Number.isFinite
+      );
+
+  const lastInterval =
+    recentIntervals.length
+      ? recentIntervals[
+          recentIntervals.length - 1
+        ]
+      : null;
+
+  return {
+    rate5s:
+      packets5s /
+      (
+        PACKET_RATE_WINDOW_MS /
+        1000
+      ),
+
+    lastInterval,
+
+    avgInterval:
+      average(
+        recentIntervals
+      ),
+
+    minInterval:
+      recentIntervals.length
+        ? Math.min(
+            ...recentIntervals
+          )
+        : null,
+
+    maxInterval:
+      recentIntervals.length
+        ? Math.max(
+            ...recentIntervals
+          )
+        : null,
+
+    packets60s:
+      timing.arrivals.length
+  };
+}
+
+function getGlobalPacketRate() {
+  const now =
+    Date.now();
+
+  const cutoff =
+    now -
+    PACKET_RATE_WINDOW_MS;
+
+  let count =
+    0;
+
+  for (
+    const timing
+    of liveState.packetTiming.values()
+  ) {
+    count +=
+      timing.arrivals.filter(
+        timestamp =>
+          timestamp >= cutoff
+      ).length;
+  }
+
+  return (
+    count /
+    (
+      PACKET_RATE_WINDOW_MS /
+      1000
+    )
+  );
 }
 
 // ============================================================
@@ -354,7 +598,8 @@ async function loadRegisteredDevices(
             mac,
             {
               ...beacon,
-              normalized_mac: mac
+              normalized_mac:
+                mac
             }
           );
         }
@@ -381,7 +626,8 @@ async function loadRegisteredDevices(
             mac,
             {
               ...gateway,
-              normalized_mac: mac
+              normalized_mac:
+                mac
             }
           );
         }
@@ -391,6 +637,7 @@ async function loadRegisteredDevices(
             Date.now(),
 
           beacons,
+
           gateways
         };
 
@@ -434,9 +681,11 @@ function ensureGatewayState({
     liveState.gateways.set(
       gatewayMac,
       {
-        name: gatewayName,
+        name:
+          gatewayName,
 
-        mac: gatewayMac,
+        mac:
+          gatewayMac,
 
         registered,
 
@@ -487,8 +736,8 @@ function updateGatewayBeaconState(
     Date.now();
 
   for (
-    const row of
-    rowsToSave
+    const row
+    of rowsToSave
   ) {
     gatewayState.beacons.set(
       row.beacon_mac,
@@ -497,7 +746,8 @@ function updateGatewayBeaconState(
           row.rssi,
 
         samples:
-          row.sample_count || 0,
+          row.sample_count ||
+          0,
 
         lastSeen:
           now
@@ -550,11 +800,27 @@ async function processMg4Packet(
     );
   }
 
+  // ==========================================================
+  // IMPORTANT:
+  // RECORD MG4 HTTP ARRIVAL IMMEDIATELY
+  // ==========================================================
+  //
+  // This happens BEFORE device cache lookup and BEFORE
+  // Supabase saving.
+  //
+  // Therefore this tells us the real MG4 -> HTTP POST interval.
+  // ==========================================================
+
+  recordPacketArrival(
+    gatewayMac,
+    Date.now()
+  );
+
   try {
     await loadRegisteredDevices();
   } catch {
-    // Continue accepting MG4 packets even if
-    // refreshing the cache temporarily fails.
+    // Continue accepting packets
+    // even if cache refresh fails.
   }
 
   const registeredGateway =
@@ -597,8 +863,8 @@ async function processMg4Packet(
     new Map();
 
   for (
-    const reading of
-    readings
+    const reading
+    of readings
   ) {
     const beaconMac =
       normalizeMac(
@@ -633,7 +899,7 @@ async function processMg4Packet(
       continue;
     }
 
-    // Ignore gateway MACs appearing in BLE scan.
+    // Ignore gateway MACs.
     if (
       deviceCache
         .gateways
@@ -670,7 +936,9 @@ async function processMg4Packet(
       )
       .push({
         rssi,
-        raw: reading
+
+        raw:
+          reading
       });
   }
 
@@ -695,7 +963,8 @@ async function processMg4Packet(
     const [
       beaconMac,
       samples
-    ] of grouped
+    ]
+    of grouped
   ) {
     const packetMedian =
       median(
@@ -754,14 +1023,13 @@ async function processMg4Packet(
     rowsToSave
   );
 
-  // Remove local-only sample_count
-  // before writing to Supabase.
   const databaseRows =
     rowsToSave.map(
       ({
         sample_count,
         ...row
-      }) => row
+      }) =>
+        row
     );
 
   // ==========================================================
@@ -821,15 +1089,20 @@ async function processMg4Packet(
   gatewayState.lastSave =
     saveTime;
 
-  // Render logs are not interactive.
-  // Give a lightweight log when hosted.
   if (
     !process.stdout.isTTY
   ) {
+    const metrics =
+      getPacketMetrics(
+        gatewayMac
+      );
+
     console.log(
       `MG4 ${gatewayName} | ` +
       `${gatewayMac} | ` +
-      `${databaseRows.length} beacon(s) saved`
+      `${databaseRows.length} beacon(s) saved | ` +
+      `HTTP ${metrics.rate5s.toFixed(2)} pkt/s | ` +
+      `interval ${formatDuration(metrics.lastInterval)}`
     );
   }
 }
@@ -839,8 +1112,6 @@ async function processMg4Packet(
 // ============================================================
 
 function renderDashboard() {
-  // Render/non-interactive hosting does not use
-  // this terminal dashboard.
   if (
     !process.stdout.isTTY
   ) {
@@ -850,7 +1121,8 @@ function renderDashboard() {
   const now =
     Date.now();
 
-  let output = "";
+  let output =
+    "";
 
   output +=
     "======================================================================\n";
@@ -883,6 +1155,9 @@ function renderDashboard() {
     `Packets Received : ${liveState.packetsReceived}\n`;
 
   output +=
+    `HTTP Packets/sec : ${getGlobalPacketRate().toFixed(2)} (all gateways, 5s avg)\n`;
+
+  output +=
     `Supabase Saves   : ${liveState.supabaseSaves}\n`;
 
   output +=
@@ -898,7 +1173,8 @@ function renderDashboard() {
     "\n";
 
   if (
-    liveState.gateways.size === 0
+    liveState.gateways.size ===
+    0
   ) {
     output +=
       "Waiting for MG4 HTTP packets...\n";
@@ -916,8 +1192,8 @@ function renderDashboard() {
       );
 
   for (
-    const gateway of
-    gateways
+    const gateway
+    of gateways
   ) {
     const gatewayAge =
       now -
@@ -926,6 +1202,12 @@ function renderDashboard() {
     const online =
       gatewayAge <=
       GATEWAY_STALE_MS;
+
+    const packetMetrics =
+      getPacketMetrics(
+        gateway.mac,
+        now
+      );
 
     output +=
       "----------------------------------------------------------------------\n";
@@ -956,11 +1238,31 @@ function renderDashboard() {
           : "UNREGISTERED"
       }\n`;
 
+    // ========================================================
+    // NEW HTTP TIMING DATA
+    // ========================================================
+
+    output +=
+      `HTTP Rate       : ${packetMetrics.rate5s.toFixed(2)} pkt/s (5s avg)\n`;
+
+    output +=
+      `Last Interval   : ${formatDuration(packetMetrics.lastInterval)}\n`;
+
+    output +=
+      `Avg Interval    : ${formatDuration(packetMetrics.avgInterval)} (60s)\n`;
+
+    output +=
+      `Min Interval    : ${formatDuration(packetMetrics.minInterval)}\n`;
+
+    output +=
+      `Max Gap         : ${formatDuration(packetMetrics.maxInterval)} (60s)\n`;
+
     output +=
       "----------------------------------------------------------------------\n";
 
     if (
-      gateway.beacons.size === 0
+      gateway.beacons.size ===
+      0
     ) {
       output +=
         "No tracking beacon readings.\n\n";
@@ -986,7 +1288,8 @@ function renderDashboard() {
       const [
         beaconMac,
         reading
-      ] of beaconRows
+      ]
+      of beaconRows
     ) {
       const age =
         now -
@@ -1044,6 +1347,12 @@ function renderDashboard() {
     "======================================================================\n";
 
   output +=
+    "HTTP Rate/Interval = actual POST arrival rate from the MG4 gateway.\n";
+
+  output +=
+    "This timing is measured BEFORE Supabase processing.\n";
+
+  output +=
     "Press Ctrl+C to stop the receiver.\n";
 
   readline.cursorTo(
@@ -1071,12 +1380,6 @@ const server =
 
       // ======================================================
       // HEALTH CHECK
-      // ======================================================
-      //
-      // Browser / Render can call:
-      // GET /health
-      //
-      // MG4 still uses POST /
       // ======================================================
 
       if (
@@ -1107,6 +1410,12 @@ const server =
             packetsReceived:
               liveState.packetsReceived,
 
+            httpPacketsPerSecond:
+              Number(
+                getGlobalPacketRate()
+                  .toFixed(2)
+              ),
+
             supabaseSaves:
               liveState.supabaseSaves,
 
@@ -1115,7 +1424,8 @@ const server =
                 (
                   Date.now() -
                   liveState.startedAt
-                ) / 1000
+                ) /
+                1000
               )
           })
         );
@@ -1125,9 +1435,6 @@ const server =
 
       // ======================================================
       // ROOT GET
-      // ======================================================
-      //
-      // Useful when opening the Render URL in browser.
       // ======================================================
 
       if (
@@ -1180,6 +1487,7 @@ const server =
         res.end(
           JSON.stringify({
             success: false,
+
             message:
               "Method Not Allowed"
           })
@@ -1188,7 +1496,8 @@ const server =
         return;
       }
 
-      let body = "";
+      let body =
+        "";
 
       req.on(
         "data",
@@ -1208,9 +1517,8 @@ const server =
               JSON.parse(
                 body
               );
-          } catch (
-            error
-          ) {
+
+          } catch (error) {
             liveState.rejectedPackets++;
 
             setError(
@@ -1228,6 +1536,7 @@ const server =
             res.end(
               JSON.stringify({
                 success: false,
+
                 message:
                   "Invalid JSON"
               })
@@ -1250,11 +1559,12 @@ const server =
 
           res.end(
             JSON.stringify({
-              success: true
+              success:
+                true
             })
           );
 
-          // Process after MG4 gets HTTP 200.
+          // Process after MG4 already got HTTP 200.
           processMg4Packet(
             data
           ).catch(
@@ -1314,7 +1624,9 @@ try {
   liveState.supabaseStatus =
     "CACHE ERROR";
 
-  setError(error);
+  setError(
+    error
+  );
 }
 
 // ============================================================
@@ -1328,15 +1640,14 @@ server.listen(
     if (
       process.stdout.isTTY
     ) {
-      // Local Windows CMD
       renderDashboard();
 
       setInterval(
         renderDashboard,
         DASHBOARD_REFRESH_MS
       );
+
     } else {
-      // Render / hosted server
       console.log(
         "============================================================"
       );
@@ -1371,6 +1682,10 @@ server.listen(
 
       console.log(
         "Health check: GET /health"
+      );
+
+      console.log(
+        "Packet timing diagnostics: ENABLED"
       );
 
       console.log(
