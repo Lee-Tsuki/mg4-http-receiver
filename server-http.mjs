@@ -62,6 +62,50 @@ const PACKET_HISTORY_MS = 60000;
 const PACKET_RATE_WINDOW_MS = 5000;
 
 // ============================================================
+// MINEW E8 ACC / MOTION SETTINGS
+// ============================================================
+
+// Minimum acceleration-vector change considered movement evidence.
+const ACC_MOTION_DELTA_G = Math.max(
+  0.01,
+  Number(
+    process.env.ACC_MOTION_DELTA_G ||
+    0.10
+  )
+);
+
+const ACC_STRONG_MOTION_DELTA_G =
+  Math.max(
+    ACC_MOTION_DELTA_G,
+    Number(
+      process.env.ACC_STRONG_MOTION_DELTA_G ||
+      0.18
+    )
+  );
+
+const ACC_MOTION_REQUIRED_CHANGES =
+  Math.max(
+    1,
+    Math.floor(
+      Number(
+        process.env.ACC_MOTION_REQUIRED_CHANGES ||
+        2
+      )
+    )
+  );
+
+// After motion stops, retain "moving" briefly.
+// This prevents rapid moving/stationary flickering.
+const ACC_STATIONARY_HOLD_MS =
+  Math.max(
+    500,
+    Number(
+      process.env.ACC_STATIONARY_HOLD_MS ||
+      1800
+    )
+  );
+
+// ============================================================
 // SUPABASE
 // ============================================================
 
@@ -118,9 +162,20 @@ const liveState = {
   gateways: new Map(),
 
   // Actual HTTP arrival timing
-  packetTiming:
-    new Map()
+  packetTiming: new Map()
 };
+
+// ============================================================
+// ACC MOTION STATE
+// ============================================================
+//
+// Runtime only.
+//
+// Nothing new needs to be added to Supabase.
+// Motion information is embedded into raw_payload.
+//
+const accMotionState =
+  new Map();
 
 // ============================================================
 // HELPERS
@@ -158,7 +213,8 @@ function median(values) {
       .map(Number)
       .filter(Number.isFinite)
       .sort(
-        (a, b) => a - b
+        (a, b) =>
+          a - b
       );
 
   if (!clean.length) {
@@ -182,6 +238,451 @@ function median(values) {
   ) / 2;
 }
 
+// ============================================================
+// MINEW E8 FRAME DECODING
+// ============================================================
+
+function normalizeRawDataHex(
+  value
+) {
+  return String(value || "")
+    .replace(
+      /[^0-9a-fA-F]/g,
+      ""
+    )
+    .toUpperCase();
+}
+
+function getReadingRawData(
+  reading
+) {
+  return (
+    reading?.rawData ??
+    reading?.raw_data ??
+    reading?.data ??
+    ""
+  );
+}
+
+function classifyMinewFrame(
+  rawData
+) {
+  const hex =
+    normalizeRawDataHex(
+      rawData
+    );
+
+  if (!hex) {
+    return "unknown";
+  }
+
+  // ==========================================================
+  // APPLE IBEACON
+  // ==========================================================
+  //
+  // FF     = Manufacturer Specific Data
+  // 4C00   = Apple Manufacturer ID
+  // 0215   = iBeacon prefix
+  //
+  // Real payload observed from your Minew E8:
+  //
+  // 0201061AFF4C000215...
+  //
+  // Only the RSSI from this frame should participate
+  // in positioning.
+  // ==========================================================
+
+  if (
+    hex.includes(
+      "FF4C000215"
+    )
+  ) {
+    return "ibeacon";
+  }
+
+  // ==========================================================
+  // MINEW BEACONPLUS ACC
+  // ==========================================================
+  //
+  // Real payload observed from your E8:
+  //
+  // 0201060303E1FF1216E1FFA1...
+  //
+  // ACC RSSI must NOT be mixed into positioning RSSI.
+  // ==========================================================
+
+  if (
+    hex.includes(
+      "16E1FFA1"
+    )
+  ) {
+    return "acc";
+  }
+
+  return "other";
+}
+
+function signed16(value) {
+  return value >= 0x8000
+    ? value - 0x10000
+    : value;
+}
+
+function decodeMinewAcc(
+  rawData
+) {
+  const hex =
+    normalizeRawDataHex(
+      rawData
+    );
+
+  if (
+    hex.length < 52 ||
+    !hex.includes(
+      "16E1FFA1"
+    )
+  ) {
+    return null;
+  }
+
+  const bytes =
+    [];
+
+  for (
+    let index = 0;
+    index < hex.length;
+    index += 2
+  ) {
+    const byte =
+      Number.parseInt(
+        hex.slice(
+          index,
+          index + 2
+        ),
+        16
+      );
+
+    if (
+      !Number.isFinite(
+        byte
+      )
+    ) {
+      return null;
+    }
+
+    bytes.push(
+      byte
+    );
+  }
+
+  // ==========================================================
+  // CONFIRMED MINEW ACC LAYOUT
+  // ==========================================================
+  //
+  // byte  9 = E1
+  // byte 10 = FF
+  // byte 11 = A1
+  //
+  // byte 12 = ACC frame version
+  // byte 13 = battery %
+  //
+  // byte 14-15 = X acceleration
+  // byte 16-17 = Y acceleration
+  // byte 18-19 = Z acceleration
+  //
+  // byte 20-25 = Beacon MAC, reverse byte order
+  //
+  // Acceleration uses signed 8.8 fixed point.
+  // ==========================================================
+
+  if (
+    bytes[9] !== 0xE1 ||
+    bytes[10] !== 0xFF ||
+    bytes[11] !== 0xA1
+  ) {
+    return null;
+  }
+
+  const readAxis =
+    offset => {
+      if (
+        bytes.length <=
+        offset + 1
+      ) {
+        return null;
+      }
+
+      const raw =
+        (
+          bytes[offset] << 8
+        ) |
+        bytes[offset + 1];
+
+      return (
+        signed16(raw) /
+        256
+      );
+    };
+
+  const xG =
+    readAxis(14);
+
+  const yG =
+    readAxis(16);
+
+  const zG =
+    readAxis(18);
+
+  if (
+    !Number.isFinite(xG) ||
+    !Number.isFinite(yG) ||
+    !Number.isFinite(zG)
+  ) {
+    return null;
+  }
+
+  const macBytes =
+    bytes.length >= 26
+      ? bytes
+          .slice(20, 26)
+          .reverse()
+      : [];
+
+  const decodedBeaconMac =
+    macBytes.length === 6
+      ? macBytes
+          .map(
+            value =>
+              value
+                .toString(16)
+                .padStart(
+                  2,
+                  "0"
+                )
+          )
+          .join("")
+          .toLowerCase()
+      : null;
+
+  const magnitudeG =
+    Math.hypot(
+      xG,
+      yG,
+      zG
+    );
+
+  return {
+    version:
+      bytes[12] ??
+      null,
+
+    batteryPercent:
+      bytes[13] ??
+      null,
+
+    xG,
+
+    yG,
+
+    zG,
+
+    magnitudeG,
+
+    decodedBeaconMac
+  };
+}
+
+function accelerationDelta(
+  first,
+  second
+) {
+  if (
+    !first ||
+    !second
+  ) {
+    return null;
+  }
+
+  return Math.hypot(
+    second.xG -
+      first.xG,
+
+    second.yG -
+      first.yG,
+
+    second.zG -
+      first.zG
+  );
+}
+
+function updateAccMotionState(
+  beaconMac,
+  accSamples,
+  now = Date.now()
+) {
+  const previous =
+    accMotionState.get(
+      beaconMac
+    ) || {
+      state:
+        "unknown",
+
+      lastMotionAt:
+        null,
+
+      lastVector:
+        null,
+
+      updatedAt:
+        null
+    };
+
+  let lastVector =
+    previous.lastVector;
+
+  const deltas =
+    [];
+
+  const sampleDeltas =
+    [];
+
+  for (
+    const sample
+    of accSamples
+  ) {
+    const decoded =
+      sample?.decodedAcc;
+
+    if (!decoded) {
+      sampleDeltas.push(
+        null
+      );
+
+      continue;
+    }
+
+    const delta =
+      accelerationDelta(
+        lastVector,
+        decoded
+      );
+
+    sampleDeltas.push(
+      delta
+    );
+
+    if (
+      Number.isFinite(
+        delta
+      )
+    ) {
+      deltas.push(
+        delta
+      );
+    }
+
+    lastVector = {
+      xG:
+        decoded.xG,
+
+      yG:
+        decoded.yG,
+
+      zG:
+        decoded.zG
+    };
+  }
+
+  const significantChanges =
+    deltas.filter(
+      delta =>
+        delta >=
+        ACC_MOTION_DELTA_G
+    ).length;
+
+  const maxDeltaG =
+    deltas.length
+      ? Math.max(
+          ...deltas
+        )
+      : 0;
+
+  const movementEvidence =
+    significantChanges >=
+      ACC_MOTION_REQUIRED_CHANGES ||
+    maxDeltaG >=
+      ACC_STRONG_MOTION_DELTA_G;
+
+  let lastMotionAt =
+    previous.lastMotionAt;
+
+  let state =
+    previous.state;
+
+  if (
+    movementEvidence
+  ) {
+    state =
+      "moving";
+
+    lastMotionAt =
+      now;
+
+  } else if (
+    Number.isFinite(
+      lastMotionAt
+    ) &&
+    now -
+      lastMotionAt <
+      ACC_STATIONARY_HOLD_MS
+  ) {
+    state =
+      "moving";
+
+  } else if (
+    accSamples.length >= 2 ||
+    previous.lastVector
+  ) {
+    state =
+      "stationary";
+
+  } else {
+    state =
+      "unknown";
+  }
+
+  const next = {
+    state,
+
+    moving:
+      state === "moving"
+        ? true
+        : state === "stationary"
+          ? false
+          : null,
+
+    lastMotionAt,
+
+    lastVector,
+
+    updatedAt:
+      now,
+
+    maxDeltaG,
+
+    significantChanges,
+
+    sampleDeltas
+  };
+
+  accMotionState.set(
+    beaconMac,
+    next
+  );
+
+  return next;
+}
+
 function average(values) {
   const clean =
     values.filter(
@@ -194,7 +695,10 @@ function average(values) {
 
   return (
     clean.reduce(
-      (sum, value) =>
+      (
+        sum,
+        value
+      ) =>
         sum + value,
       0
     ) /
@@ -208,28 +712,43 @@ function formatAge(timestamp) {
   }
 
   const age =
-    Date.now() - timestamp;
+    Date.now() -
+    timestamp;
 
-  if (age < 1000) {
+  if (
+    age < 1000
+  ) {
     return `${age}ms`;
   }
 
-  return `${(age / 1000).toFixed(1)}s`;
+  return `${(
+    age / 1000
+  ).toFixed(1)}s`;
 }
 
 function formatDuration(ms) {
-  if (!Number.isFinite(ms)) {
+  if (
+    !Number.isFinite(
+      ms
+    )
+  ) {
     return "-";
   }
 
-  if (ms < 1000) {
+  if (
+    ms < 1000
+  ) {
     return `${Math.round(ms)}ms`;
   }
 
-  return `${(ms / 1000).toFixed(2)}s`;
+  return `${(
+    ms / 1000
+  ).toFixed(2)}s`;
 }
 
-function formatClock(timestamp) {
+function formatClock(
+  timestamp
+) {
   if (!timestamp) {
     return "-";
   }
@@ -255,7 +774,9 @@ function formatUptime() {
 
   const minutes =
     Math.floor(
-      (seconds % 3600) / 60
+      (
+        seconds % 3600
+      ) / 60
     );
 
   const remainingSeconds =
@@ -281,11 +802,11 @@ function setError(error) {
 // HTTP PACKET TIMING
 // ============================================================
 //
-// This measures when the Node server ACTUALLY receives
-// each HTTP POST from each MG4.
+// Measures when Node actually receives each HTTP POST
+// from each MG4.
 //
-// This measurement occurs BEFORE Supabase work,
-// so Supabase cannot influence this timing.
+// This runs BEFORE device-cache lookup and BEFORE Supabase,
+// therefore Supabase does not affect this timing.
 // ============================================================
 
 function recordPacketArrival(
@@ -306,9 +827,11 @@ function recordPacketArrival(
         lastAt:
           null,
 
-        arrivals: [],
+        arrivals:
+          [],
 
-        intervals: []
+        intervals:
+          []
       }
     );
   }
@@ -378,12 +901,23 @@ function getPacketMetrics(
 
   if (!timing) {
     return {
-      rate5s: 0,
-      lastInterval: null,
-      avgInterval: null,
-      minInterval: null,
-      maxInterval: null,
-      packets60s: 0
+      rate5s:
+        0,
+
+      lastInterval:
+        null,
+
+      avgInterval:
+        null,
+
+      minInterval:
+        null,
+
+      maxInterval:
+        null,
+
+      packets60s:
+        0
     };
   }
 
@@ -404,7 +938,7 @@ function getPacketMetrics(
         item =>
           item.at >=
           now -
-          PACKET_HISTORY_MS
+            PACKET_HISTORY_MS
       )
       .map(
         item =>
@@ -417,7 +951,8 @@ function getPacketMetrics(
   const lastInterval =
     recentIntervals.length
       ? recentIntervals[
-          recentIntervals.length - 1
+          recentIntervals.length -
+          1
         ]
       : null;
 
@@ -473,7 +1008,8 @@ function getGlobalPacketRate() {
     count +=
       timing.arrivals.filter(
         timestamp =>
-          timestamp >= cutoff
+          timestamp >=
+          cutoff
       ).length;
   }
 
@@ -491,7 +1027,8 @@ function getGlobalPacketRate() {
 // ============================================================
 
 let deviceCache = {
-  loadedAt: 0,
+  loadedAt:
+    0,
 
   beacons:
     new Map(),
@@ -537,7 +1074,9 @@ async function loadRegisteredDevices(
         ] =
           await Promise.all([
             supabase
-              .from("beacons")
+              .from(
+                "beacons"
+              )
               .select(`
                 id,
                 shelter_id,
@@ -550,7 +1089,9 @@ async function loadRegisteredDevices(
               `),
 
             supabase
-              .from("gateways")
+              .from(
+                "gateways"
+              )
               .select(`
                 id,
                 shelter_id,
@@ -580,8 +1121,9 @@ async function loadRegisteredDevices(
           new Map();
 
         for (
-          const beacon of
-          beaconResult.data || []
+          const beacon
+          of beaconResult.data ||
+            []
         ) {
           const mac =
             normalizeMac(
@@ -589,7 +1131,9 @@ async function loadRegisteredDevices(
             );
 
           if (
-            !isValidMac(mac)
+            !isValidMac(
+              mac
+            )
           ) {
             continue;
           }
@@ -598,6 +1142,7 @@ async function loadRegisteredDevices(
             mac,
             {
               ...beacon,
+
               normalized_mac:
                 mac
             }
@@ -608,8 +1153,9 @@ async function loadRegisteredDevices(
           new Map();
 
         for (
-          const gateway of
-          gatewayResult.data || []
+          const gateway
+          of gatewayResult.data ||
+            []
         ) {
           const mac =
             normalizeMac(
@@ -617,7 +1163,9 @@ async function loadRegisteredDevices(
             );
 
           if (
-            !isValidMac(mac)
+            !isValidMac(
+              mac
+            )
           ) {
             continue;
           }
@@ -626,6 +1174,7 @@ async function loadRegisteredDevices(
             mac,
             {
               ...gateway,
+
               normalized_mac:
                 mac
             }
@@ -650,7 +1199,9 @@ async function loadRegisteredDevices(
         liveState.deviceCacheStatus =
           "ERROR";
 
-        setError(error);
+        setError(
+          error
+        );
 
         throw error;
 
@@ -690,7 +1241,8 @@ function ensureGatewayState({
         registered,
 
         battery:
-          battery || "-",
+          battery ||
+          "-",
 
         lastSeen:
           Date.now(),
@@ -698,7 +1250,8 @@ function ensureGatewayState({
         lastSave:
           null,
 
-        packets: 0,
+        packets:
+          0,
 
         beacons:
           new Map()
@@ -766,7 +1319,9 @@ async function processMg4Packet(
   liveState.packetsReceived++;
 
   if (
-    !Array.isArray(data) ||
+    !Array.isArray(
+      data
+    ) ||
     data.length === 0
   ) {
     liveState.rejectedPackets++;
@@ -801,14 +1356,7 @@ async function processMg4Packet(
   }
 
   // ==========================================================
-  // IMPORTANT:
-  // RECORD MG4 HTTP ARRIVAL IMMEDIATELY
-  // ==========================================================
-  //
-  // This happens BEFORE device cache lookup and BEFORE
-  // Supabase saving.
-  //
-  // Therefore this tells us the real MG4 -> HTTP POST interval.
+  // RECORD REAL MG4 HTTP ARRIVAL
   // ==========================================================
 
   recordPacketArrival(
@@ -819,8 +1367,8 @@ async function processMg4Packet(
   try {
     await loadRegisteredDevices();
   } catch {
-    // Continue accepting packets
-    // even if cache refresh fails.
+    // Keep accepting packets even if cache refresh
+    // temporarily fails.
   }
 
   const registeredGateway =
@@ -833,7 +1381,8 @@ async function processMg4Packet(
       ?.gateway_name ||
     gatewayHeader
       ?.mark_name ||
-    gatewayMac.toUpperCase();
+    gatewayMac
+      .toUpperCase();
 
   const gatewayState =
     ensureGatewayState({
@@ -899,7 +1448,7 @@ async function processMg4Packet(
       continue;
     }
 
-    // Ignore gateway MACs.
+    // Ignore known gateway MACs.
     if (
       deviceCache
         .gateways
@@ -930,12 +1479,33 @@ async function processMg4Packet(
       );
     }
 
+    const rawData =
+      getReadingRawData(
+        reading
+      );
+
+    const frameType =
+      classifyMinewFrame(
+        rawData
+      );
+
+    const decodedAcc =
+      frameType === "acc"
+        ? decodeMinewAcc(
+            rawData
+          )
+        : null;
+
     grouped
       .get(
         beaconMac
       )
       .push({
         rssi,
+
+        frameType,
+
+        decodedAcc,
 
         raw:
           reading
@@ -966,9 +1536,65 @@ async function processMg4Packet(
     ]
     of grouped
   ) {
+    // ========================================================
+    // SEPARATE POSITIONING AND ACC FRAMES
+    // ========================================================
+
+    const iBeaconSamples =
+      samples.filter(
+        sample =>
+          sample.frameType ===
+          "ibeacon"
+      );
+
+    const accSamples =
+      samples.filter(
+        sample =>
+          sample.frameType ===
+            "acc" &&
+          sample.decodedAcc
+      );
+
+    const hasKnownFrame =
+      samples.some(
+        sample =>
+          sample.frameType ===
+            "ibeacon" ||
+          sample.frameType ===
+            "acc"
+      );
+
+    // ========================================================
+    // POSITIONING SAMPLE RULE
+    // ========================================================
+    //
+    // New Minew E8:
+    //   ONLY iBeacon RSSI is used for position.
+    //
+    // Old/unrecognized beacon:
+    //   Preserve the original receiver behavior.
+    //
+    // ACC-only packet:
+    //   Do not replace positioning RSSI with ACC RSSI.
+    // ========================================================
+
+    const positioningSamples =
+      iBeaconSamples.length > 0
+        ? iBeaconSamples
+        : hasKnownFrame
+          ? []
+          : samples;
+
+    if (
+      positioningSamples.length ===
+      0
+    ) {
+      continue;
+    }
+
     const packetMedian =
       median(
-        samples.map(
+        positioningSamples.map(
           sample =>
             sample.rssi
         )
@@ -982,6 +1608,116 @@ async function processMg4Packet(
       continue;
     }
 
+    // ========================================================
+    // ACC MOTION DETECTION
+    // ========================================================
+
+    const motion =
+      updateAccMotionState(
+        beaconMac,
+        accSamples,
+        Date.now()
+      );
+
+    let accIndex =
+      0;
+
+    // ========================================================
+    // PRESERVE AND ENRICH RAW PAYLOAD
+    // ========================================================
+
+    const enrichedRawPayload =
+      samples.map(
+        sample => {
+          if (
+            sample.frameType ===
+            "ibeacon"
+          ) {
+            return {
+              ...sample.raw,
+
+              frameType:
+                "iBeacon"
+            };
+          }
+
+          if (
+            sample.frameType ===
+              "acc" &&
+            sample.decodedAcc
+          ) {
+            const deltaG =
+              motion.sampleDeltas[
+                accIndex
+              ] ??
+              null;
+
+            accIndex++;
+
+            return {
+              ...sample.raw,
+
+              frameType:
+                "ACC",
+
+              accX:
+                sample
+                  .decodedAcc
+                  .xG,
+
+              accY:
+                sample
+                  .decodedAcc
+                  .yG,
+
+              accZ:
+                sample
+                  .decodedAcc
+                  .zG,
+
+              accelerationMagnitudeG:
+                sample
+                  .decodedAcc
+                  .magnitudeG,
+
+              batteryPercent:
+                sample
+                  .decodedAcc
+                  .batteryPercent,
+
+              accVersion:
+                sample
+                  .decodedAcc
+                  .version,
+
+              decodedBeaconMac:
+                sample
+                  .decodedAcc
+                  .decodedBeaconMac,
+
+              motionDeltaG:
+                deltaG,
+
+              motionDetected:
+                motion.moving,
+
+              motionState:
+                motion.state
+            };
+          }
+
+          return {
+            ...sample.raw,
+
+            frameType:
+              sample.frameType ===
+                "other"
+                ? "Other"
+                : "Unknown"
+          };
+        }
+      );
+
     rowsToSave.push({
       tenant_key:
         TENANT_KEY,
@@ -992,23 +1728,24 @@ async function processMg4Packet(
       beacon_mac:
         beaconMac,
 
+      // Positioning RSSI is calculated from
+      // iBeacon advertisements ONLY.
       rssi:
         Math.round(
           packetMedian
         ),
 
+      // Contains both iBeacon and decoded ACC frames.
       raw_payload:
-        samples.map(
-          sample =>
-            sample.raw
-        ),
+        enrichedRawPayload,
 
       updated_at:
         updatedAt,
 
-      // Local dashboard only.
+      // Dashboard only.
+      // Count only positioning samples.
       sample_count:
-        samples.length
+        positioningSamples.length
     });
   }
 
@@ -1185,7 +1922,10 @@ function renderDashboard() {
       liveState.gateways.values()
     )
       .sort(
-        (a, b) =>
+        (
+          a,
+          b
+        ) =>
           a.name.localeCompare(
             b.name
           )
@@ -1238,10 +1978,6 @@ function renderDashboard() {
           : "UNREGISTERED"
       }\n`;
 
-    // ========================================================
-    // NEW HTTP TIMING DATA
-    // ========================================================
-
     output +=
       `HTTP Rate       : ${packetMetrics.rate5s.toFixed(2)} pkt/s (5s avg)\n`;
 
@@ -1278,7 +2014,10 @@ function renderDashboard() {
         gateway.beacons.entries()
       )
         .sort(
-          ([macA], [macB]) =>
+          (
+            [macA],
+            [macB]
+          ) =>
             macA.localeCompare(
               macB
             )
@@ -1376,7 +2115,10 @@ function renderDashboard() {
 
 const server =
   http.createServer(
-    (req, res) => {
+    (
+      req,
+      res
+    ) => {
 
       // ======================================================
       // HEALTH CHECK
@@ -1396,7 +2138,8 @@ const server =
 
         res.end(
           JSON.stringify({
-            success: true,
+            success:
+              true,
 
             service:
               "MG4 HTTP Receiver",
@@ -1486,7 +2229,8 @@ const server =
 
         res.end(
           JSON.stringify({
-            success: false,
+            success:
+              false,
 
             message:
               "Method Not Allowed"
@@ -1535,7 +2279,8 @@ const server =
 
             res.end(
               JSON.stringify({
-                success: false,
+                success:
+                  false,
 
                 message:
                   "Invalid JSON"
@@ -1564,7 +2309,7 @@ const server =
             })
           );
 
-          // Process after MG4 already got HTTP 200.
+          // Process after MG4 already received HTTP 200.
           processMg4Packet(
             data
           ).catch(
@@ -1686,6 +2431,10 @@ server.listen(
 
       console.log(
         "Packet timing diagnostics: ENABLED"
+      );
+
+      console.log(
+        "Minew E8 iBeacon/ACC separation: ENABLED"
       );
 
       console.log(
