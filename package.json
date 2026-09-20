@@ -1,19 +1,19 @@
 {
   "name": "mg4-mqtt-test",
   "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "description": "MG4 HTTP receiver for BLE tracking data",
+  "main": "server-http.mjs",
   "scripts": {
     "start": "node server-http.mjs",
     "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "engines": {
+    "node": ">=22"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "type": "commonjs",
-  "engines": {
-    "node": ">=20"
-  },
   "dependencies": {
     "@supabase/supabase-js": "^2.106.2",
     "aedes": "^1.0.2",
