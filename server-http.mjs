@@ -1026,6 +1026,86 @@ function getGlobalPacketRate() {
 // DEVICE CACHE
 // ============================================================
 
+// One channel (including an in-flight subscription) per shelter.
+const trackingBroadcastChannels = new Map();
+
+function getTrackingBroadcastChannel(shelterId) {
+  const key = String(shelterId || "").trim();
+  if (!key) return Promise.resolve(null);
+
+  const existing = trackingBroadcastChannels.get(key);
+  if (existing) return existing.ready;
+
+  const channel = supabase.channel(`tracking-live:${key}`, {
+    config: { private: true }
+  });
+  let resolveReady;
+  let rejectReady;
+  const entry = {
+    channel,
+    ready: new Promise((resolve, reject) => {
+      resolveReady = resolve;
+      rejectReady = reject;
+    })
+  };
+  trackingBroadcastChannels.set(key, entry);
+
+  const fail = error => {
+    if (trackingBroadcastChannels.get(key) !== entry) return;
+    trackingBroadcastChannels.delete(key);
+    clearTimeout(timer);
+    rejectReady(error);
+    setError(`Broadcast: ${error?.message || error}`);
+    // Evict failed channels so a later packet can retry the subscription.
+    void Promise.resolve().then(() => supabase.removeChannel(channel))
+      .catch(error => setError(`Broadcast cleanup: ${error?.message || error}`));
+  };
+  const timer = setTimeout(() => {
+    fail(new Error("Broadcast subscribe timed out"));
+  }, 10000);
+  timer.unref?.();
+
+  try {
+    channel.subscribe((status, error) => {
+      if (status === "SUBSCRIBED") {
+        clearTimeout(timer);
+        resolveReady(channel);
+      } else if (
+        status === "CHANNEL_ERROR" ||
+        status === "TIMED_OUT" ||
+        status === "CLOSED"
+      ) {
+        fail(error || new Error(`Broadcast subscribe failed: ${status}`));
+      }
+    });
+  } catch (error) {
+    fail(error);
+  }
+  return entry.ready;
+}
+
+async function broadcastTrackingRows(shelterId, rows) {
+  try {
+    const channel = await getTrackingBroadcastChannel(shelterId);
+    if (!channel) return;
+
+    const result = await channel.send({
+      type: "broadcast",
+      event: "tracking-readings",
+      payload: {
+        rows,
+        receiverSentAt: new Date().toISOString()
+      }
+    });
+    if (result !== "ok") {
+      throw new Error(`Broadcast send failed: ${result}`);
+    }
+  } catch (error) {
+    // Broadcast accelerates updates; persistence must still proceed.
+    setError(`Broadcast: ${error?.message || error}`);
+  }
+}
+
 let deviceCache = {
   loadedAt:
     0,
@@ -1364,11 +1444,18 @@ async function processMg4Packet(
     Date.now()
   );
 
-  try {
-    await loadRegisteredDevices();
-  } catch {
-    // Keep accepting packets even if cache refresh
-    // temporarily fails.
+  if (deviceCache.loadedAt <= 0) {
+    try {
+      await loadRegisteredDevices(true);
+    } catch {
+      // Retry once with no usable cache, then keep accepting packets.
+    }
+  } else if (
+    Date.now() - deviceCache.loadedAt >= DEVICE_CACHE_TTL_MS &&
+    !cacheLoadingPromise
+  ) {
+    // Keep using the last valid cache while refreshing in the background.
+    void loadRegisteredDevices(true).catch(setError);
   }
 
   const registeredGateway =
@@ -1585,6 +1672,17 @@ async function processMg4Packet(
           ? []
           : samples;
 
+    // ========================================================
+    // ACC MOTION DETECTION
+    // ========================================================
+
+    const motion =
+      updateAccMotionState(
+        beaconMac,
+        accSamples,
+        Date.now()
+      );
+
     if (
       positioningSamples.length ===
       0
@@ -1608,17 +1706,6 @@ async function processMg4Packet(
       continue;
     }
 
-    // ========================================================
-    // ACC MOTION DETECTION
-    // ========================================================
-
-    const motion =
-      updateAccMotionState(
-        beaconMac,
-        accSamples,
-        Date.now()
-      );
-
     let accIndex =
       0;
 
@@ -1637,7 +1724,16 @@ async function processMg4Packet(
               ...sample.raw,
 
               frameType:
-                "iBeacon"
+                "iBeacon",
+
+              motionDetected:
+                motion.moving,
+
+              motionState:
+                motion.state,
+
+              motionUpdatedAt:
+                motion.updatedAt
             };
           }
 
@@ -1772,6 +1868,11 @@ async function processMg4Packet(
   // ==========================================================
   // SAVE TO SUPABASE
   // ==========================================================
+
+  const shelterId = registeredGateway?.shelter_id;
+  if (shelterId) {
+    void broadcastTrackingRows(shelterId, databaseRows);
+  }
 
   liveState.supabaseStatus =
     "Saving...";
