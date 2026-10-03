@@ -198,6 +198,17 @@ lastSaveAt: null,
 
 lastError: null,
 
+// Separate authoritative-tracking diagnostics. Raw-reading saves can succeed
+// even when authoritative localization cannot run, so do not hide those errors
+// behind the general Supabase status.
+authoritativeCalculations: 0,
+authoritativeSaves: 0,
+authoritativeLastAt: null,
+authoritativeLastSaveAt: null,
+authoritativeLastError: null,
+authoritativeLastSkip: null,
+authoritativeUnresolvedRows: 0,
+
 gateways: new Map(),
 
 // Actual HTTP arrival timing
@@ -837,6 +848,39 @@ error ||
 );
 }
 
+let lastAuthoritativeLogMessage = null;
+let lastAuthoritativeLogAt = 0;
+
+function logAuthoritativeIssue(message, level = "warn") {
+  const text = String(message || "Unknown authoritative tracking issue");
+  const now = Date.now();
+
+  // Avoid one identical warning per MG4 packet in hosted logs.
+  if (text === lastAuthoritativeLogMessage && now - lastAuthoritativeLogAt < 5000) {
+    return;
+  }
+
+  lastAuthoritativeLogMessage = text;
+  lastAuthoritativeLogAt = now;
+
+  if (!process.stdout.isTTY) {
+    const logger = level === "error" ? console.error : console.warn;
+    logger(`[authoritative] ${text}`);
+  }
+}
+
+function setAuthoritativeError(error) {
+  const message = String(error?.message || error || "Unknown authoritative tracking error");
+  liveState.authoritativeLastError = message;
+  logAuthoritativeIssue(message, "error");
+}
+
+function setAuthoritativeSkip(message) {
+  const text = String(message || "Authoritative tracking skipped");
+  liveState.authoritativeLastSkip = text;
+  logAuthoritativeIssue(text, "warn");
+}
+
 // ============================================================
 // HTTP PACKET TIMING
 // ============================================================
@@ -1321,7 +1365,7 @@ async function refreshAuthoritativeShelterConfig(shelterId) {
         .maybeSingle(),
       supabase
         .from("gateways")
-        .select("id, gateway_name, mac_address, x_position, y_position, status")
+        .select("id, gateway_name, mac_address, x_position, y_position, status, is_assigned")
         .eq("shelter_id", key)
     ]);
 
@@ -1333,11 +1377,42 @@ async function refreshAuthoritativeShelterConfig(shelterId) {
     }
 
     const mapRow = mapResult.data || {};
-    const mapMarkers = Array.isArray(mapRow.map_markers) ? mapRow.map_markers : [];
+    const rawMapMarkers = Array.isArray(mapRow.map_markers) ? mapRow.map_markers : [];
     const zones = Array.isArray(mapRow.map_zones)
       ? mapRow.map_zones.map(normalizeStoredZone)
       : [];
     const wallDistances = normalizeTrackingWallDistances(mapRow.map_wall_distances || null);
+    const gatewayRows = gatewayResult.data || [];
+
+    // Current MapSetup stores gateway_id + gateway_mac. Older saved maps can
+    // still contain a gateway_name without those identifiers, so hydrate that
+    // legacy marker only when the name uniquely matches one registered gateway.
+    const rowsByNormalizedName = new Map();
+    gatewayRows.forEach(row => {
+      const name = String(row?.gateway_name || "").trim().toLowerCase();
+      if (!name) return;
+      const list = rowsByNormalizedName.get(name) || [];
+      list.push(row);
+      rowsByNormalizedName.set(name, list);
+    });
+
+    const mapMarkers = rawMapMarkers.map(marker => {
+      if (marker?.gateway_id || normalizeTrackingMac(marker?.gateway_mac)) {
+        return marker;
+      }
+
+      const name = String(marker?.gateway_name || "").trim().toLowerCase();
+      const matches = name ? (rowsByNormalizedName.get(name) || []) : [];
+      if (matches.length !== 1) return marker;
+
+      const row = matches[0];
+      return {
+        ...marker,
+        gateway_id: row.id,
+        gateway_mac: row.mac_address,
+        gateway_name: marker?.gateway_name || row.gateway_name
+      };
+    });
 
     const placedGatewayIds = new Set(
       mapMarkers.map(marker => marker?.gateway_id).filter(Boolean)
@@ -1348,10 +1423,20 @@ async function refreshAuthoritativeShelterConfig(shelterId) {
         .filter(Boolean)
     );
 
-    const placedRows = (gatewayResult.data || []).filter(row =>
+    let placedRows = gatewayRows.filter(row =>
       placedGatewayIds.has(row.id) ||
       placedGatewayMacs.has(normalizeTrackingMac(row.mac_address))
     );
+
+    // Safe legacy fallback: only use assigned rows when they already contain
+    // explicit numeric percentage coordinates. Never invent center positions.
+    if (placedRows.length === 0) {
+      placedRows = gatewayRows.filter(row =>
+        row?.is_assigned === true &&
+        Number.isFinite(Number(row?.x_position)) &&
+        Number.isFinite(Number(row?.y_position))
+      );
+    }
 
     const gateways = mapTrackingGatewayRows(
       placedRows,
@@ -1531,6 +1616,7 @@ async function broadcastAuthoritativePosition(shelterId, payload) {
       throw new Error(`Authoritative Broadcast send failed: ${result}`);
     }
   } catch (error) {
+    setAuthoritativeError(`Authoritative Broadcast: ${error?.message || error}`);
     setError(`Authoritative Broadcast: ${error?.message || error}`);
   }
 }
@@ -1565,8 +1651,13 @@ function queueAuthoritativePersistence(runtime, payload) {
       if (error) {
         throw new Error(`Authoritative position save: ${error.message}`);
       }
+
+      liveState.authoritativeSaves++;
+      liveState.authoritativeLastSaveAt = Date.now();
+      liveState.authoritativeLastError = null;
     })
     .catch(error => {
+      setAuthoritativeError(error);
       setError(error);
     });
 }
@@ -1629,6 +1720,11 @@ async function runAuthoritativeCalculation(runtime) {
   try {
     const config = await getAuthoritativeShelterConfig(runtime.shelterId);
     if (!config || Object.keys(config.gateways || {}).length === 0) {
+      setAuthoritativeSkip(
+        `No placed gateway geometry for shelter ${runtime.shelterId}; ` +
+        `cannot localize beacon ${runtime.beaconMac}. Check shelter_maps.map_markers ` +
+        `and the gateways rows assigned to this shelter.`
+      );
       return;
     }
 
@@ -1651,6 +1747,10 @@ async function runAuthoritativeCalculation(runtime) {
     runtime.memory = memory;
     const payload = serializeAuthoritativeResult(runtime, result, memory, now);
     runtime.lastPayload = payload;
+    liveState.authoritativeCalculations++;
+    liveState.authoritativeLastAt = now;
+    liveState.authoritativeLastError = null;
+    liveState.authoritativeLastSkip = null;
 
     // Fast path first. Never wait for the database before telling phones the
     // already-computed authoritative result.
@@ -1661,6 +1761,7 @@ async function runAuthoritativeCalculation(runtime) {
     queueAuthoritativePersistence(runtime, payload);
     scheduleAuthoritativeStaleCheck(runtime, payload);
   } catch (error) {
+    setAuthoritativeError(`Authoritative tracking: ${error?.message || error}`);
     setError(`Authoritative tracking: ${error?.message || error}`);
   } finally {
     runtime.running = false;
@@ -1893,6 +1994,132 @@ null;
 })();
 
 return cacheLoadingPromise;
+}
+
+// ============================================================
+// AUTHORITATIVE SHELTER RESOLUTION + STARTUP RECOVERY
+// ============================================================
+// Raw rows do not contain shelter_id. The original authoritative path depended
+// only on the receiving gateway already being present in the in-memory gateway
+// cache. That meant tracking_test_live_readings could keep saving normally while
+// tracking_live_positions stayed completely empty. Resolve ownership from the
+// gateway first, then from the registered beacon as a safe fallback.
+
+function resolveTrackingShelterId(gatewayMac, beaconMac) {
+  const normalizedGatewayMac = normalizeMac(gatewayMac);
+  const normalizedBeaconMac = normalizeMac(beaconMac);
+  const gatewayShelterId = String(
+    deviceCache.gateways.get(normalizedGatewayMac)?.shelter_id || ""
+  ).trim();
+  const beaconShelterId = String(
+    deviceCache.beacons.get(normalizedBeaconMac)?.shelter_id || ""
+  ).trim();
+
+  // Never route a beacon from one registered shelter through a gateway that is
+  // explicitly registered to another shelter.
+  if (gatewayShelterId && beaconShelterId && gatewayShelterId !== beaconShelterId) {
+    return null;
+  }
+
+  return gatewayShelterId || beaconShelterId || null;
+}
+
+function groupTrackingRowsByShelter(gatewayMac, rows) {
+  const grouped = new Map();
+  const unresolved = [];
+
+  for (const row of Array.isArray(rows) ? rows : []) {
+    const shelterId = resolveTrackingShelterId(gatewayMac || row?.gateway_mac, row?.beacon_mac);
+    if (!shelterId) {
+      unresolved.push(row);
+      continue;
+    }
+
+    const list = grouped.get(shelterId) || [];
+    list.push(row);
+    grouped.set(shelterId, list);
+  }
+
+  return {grouped, unresolved};
+}
+
+function publishAndIngestResolvedRows(gatewayMac, rows) {
+  const {grouped, unresolved} = groupTrackingRowsByShelter(gatewayMac, rows);
+
+  for (const [shelterId, shelterRows] of grouped.entries()) {
+    void broadcastTrackingRows(shelterId, shelterRows);
+    ingestAuthoritativeRows(shelterId, shelterRows);
+  }
+
+  if (unresolved.length > 0) {
+    liveState.authoritativeUnresolvedRows += unresolved.length;
+  }
+
+  return {resolvedCount: Array.from(grouped.values()).reduce((sum, list) => sum + list.length, 0), unresolved};
+}
+
+async function ingestAuthoritativeRowsWithRecovery(gatewayMac, rows) {
+  let result = publishAndIngestResolvedRows(gatewayMac, rows);
+  if (result.unresolved.length === 0) return;
+
+  // A gateway/beacon may have been registered moments after the last 10-second
+  // cache refresh. Refresh once and retry the exact same rows. Duplicate rows
+  // are ignored by mergeAuthoritativeRow, so this is safe.
+  try {
+    await loadRegisteredDevices(true);
+    result = publishAndIngestResolvedRows(gatewayMac, result.unresolved);
+  } catch (error) {
+    setAuthoritativeError(`Device-cache refresh for authoritative tracking failed: ${error?.message || error}`);
+    return;
+  }
+
+  if (result.unresolved.length > 0) {
+    const sample = result.unresolved[0];
+    setAuthoritativeSkip(
+      `Could not resolve shelter ownership for gateway ${normalizeMac(gatewayMac || sample?.gateway_mac) || "unknown"} ` +
+      `and beacon ${normalizeMac(sample?.beacon_mac) || "unknown"}. ` +
+      `Raw tracking rows are being saved, but authoritative positions cannot be written until ` +
+      `the gateway or beacon is registered to a shelter.`
+    );
+  }
+}
+
+async function recoverAuthoritativeFromStoredReadings() {
+  try {
+    const {data, error} = await supabase
+      .from("tracking_test_live_readings")
+      .select("tenant_key, gateway_mac, beacon_mac, rssi, raw_payload, updated_at")
+      .eq("tenant_key", TENANT_KEY)
+      .order("updated_at", {ascending: false})
+      .limit(2048);
+
+    if (error) {
+      throw new Error(`Authoritative startup recovery: ${error.message}`);
+    }
+
+    const newestByPair = new Map();
+    for (const row of data || []) {
+      const gatewayMac = normalizeMac(row?.gateway_mac);
+      const beaconMac = normalizeMac(row?.beacon_mac);
+      if (!gatewayMac || !beaconMac) continue;
+      const pairKey = `${gatewayMac}::${beaconMac}`;
+      if (!newestByPair.has(pairKey)) newestByPair.set(pairKey, row);
+    }
+
+    const rowsByGateway = new Map();
+    for (const row of newestByPair.values()) {
+      const gatewayMac = normalizeMac(row?.gateway_mac);
+      const list = rowsByGateway.get(gatewayMac) || [];
+      list.push(row);
+      rowsByGateway.set(gatewayMac, list);
+    }
+
+    for (const [gatewayMac, rows] of rowsByGateway.entries()) {
+      await ingestAuthoritativeRowsWithRecovery(gatewayMac, rows);
+    }
+  } catch (error) {
+    setAuthoritativeError(error);
+  }
 }
 
 // ============================================================
@@ -2470,14 +2697,12 @@ row
 // SAVE TO SUPABASE
 // ==========================================================
 
-  const shelterId = registeredGateway?.shelter_id;
-  if (shelterId) {
-    // Preserve the existing raw-reading Broadcast for staff tracking and
-    // diagnostics, while also feeding the one receiver-side authoritative
-    // animal tracker used by every phone in this shelter.
-    void broadcastTrackingRows(shelterId, databaseRows);
-    ingestAuthoritativeRows(shelterId, databaseRows);
-  }
+  // Resolve tenant ownership independently from raw persistence. The old code
+  // skipped authoritative tracking whenever this gateway was temporarily absent
+  // from the in-memory registration cache, even though raw rows still saved.
+  // That exact split produces an updating tracking_test_live_readings table with
+  // an empty tracking_live_positions table.
+  void ingestAuthoritativeRowsWithRecovery(gatewayMac, databaseRows);
 
 liveState.supabaseStatus =
 "Saving...";
@@ -2868,6 +3093,21 @@ getGlobalPacketRate()
 supabaseSaves:
 liveState.supabaseSaves,
 
+authoritative: {
+calculations: liveState.authoritativeCalculations,
+saves: liveState.authoritativeSaves,
+lastCalculationAt: liveState.authoritativeLastAt
+  ? new Date(liveState.authoritativeLastAt).toISOString()
+  : null,
+lastSaveAt: liveState.authoritativeLastSaveAt
+  ? new Date(liveState.authoritativeLastSaveAt).toISOString()
+  : null,
+lastError: liveState.authoritativeLastError,
+lastSkip: liveState.authoritativeLastSkip,
+unresolvedRows: liveState.authoritativeUnresolvedRows,
+runtimes: authoritativeRuntime.size
+},
+
 uptimeSeconds:
 Math.floor(
 (
@@ -3070,6 +3310,11 @@ true
 
 // Warm shelter geometry/calibration outside the packet hot path.
 preloadAuthoritativeShelterConfigs();
+
+// Seed the authoritative runtime from the latest raw rows already in Supabase.
+// This makes tracking_live_positions recover immediately after a receiver
+// restart/deploy instead of waiting for every gateway to POST again.
+await recoverAuthoritativeFromStoredReadings();
 
 liveState.supabaseStatus =
 "CONNECTED";
