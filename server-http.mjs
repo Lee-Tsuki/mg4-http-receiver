@@ -1,7 +1,25 @@
 import "dotenv/config";
 import http from "node:http";
 import readline from "node:readline";
+import { createRequire } from "node:module";
 import { createClient } from "@supabase/supabase-js";
+
+const require = createRequire(import.meta.url);
+const {
+  createInitialTrackingMemory,
+  calculateTrackingResult
+} = require("./tracking/trackingEngine.js");
+const {
+  mapGatewayRows: mapTrackingGatewayRows,
+  normalizeMac: normalizeTrackingMac,
+  normalizeWallDistances: normalizeTrackingWallDistances
+} = require("./tracking/gatewayUtils.js");
+const {
+  buildGatewayGeometrySignature
+} = require("./tracking/calibrationEngine.js");
+const {
+  DEFAULT_TRACKING_CONFIG
+} = require("./tracking/trackingConfig.js");
 
 // ============================================================
 // MG4 HTTP -> SUPABASE BRIDGE
@@ -60,6 +78,27 @@ const BEACON_STALE_MS = 5000;
 // Packet diagnostics
 const PACKET_HISTORY_MS = 60000;
 const PACKET_RATE_WINDOW_MS = 5000;
+
+// ============================================================
+// AUTHORITATIVE MULTI-PHONE LIVE TRACKING
+// ============================================================
+// One receiver-side tracking engine calculates the final animal position once.
+// Every phone in the shelter receives that exact same result. The existing raw
+// reading Broadcast and tracking_test_live_readings persistence remain unchanged.
+
+const AUTHORITATIVE_BATCH_MS = Math.max(
+  10,
+  Number(process.env.AUTHORITATIVE_BATCH_MS || 35)
+);
+
+const AUTHORITATIVE_CONFIG_TTL_MS = Math.max(
+  1000,
+  Number(process.env.AUTHORITATIVE_CONFIG_TTL_MS || 10000)
+);
+
+const AUTHORITATIVE_POSITION_TABLE =
+  process.env.AUTHORITATIVE_POSITION_TABLE ||
+  "tracking_live_positions";
 
 // ============================================================
 // MINEW E8 ACC / MOTION SETTINGS
@@ -1106,6 +1145,566 @@ async function broadcastTrackingRows(shelterId, rows) {
   }
 }
 
+// ============================================================
+// AUTHORITATIVE TRACKING ENGINE
+// ============================================================
+//
+// The mobile app still owns Map Setup / calibration UI. The saved shelter map,
+// gateway geometry and tracking_calibration are loaded here from Supabase and
+// reused by the exact same tracking algorithm modules. Only the FINAL live
+// animal result moves to the receiver so separate phones cannot diverge.
+//
+// Raw readings continue to be saved/broadcast exactly as before.
+// ============================================================
+
+const authoritativeShelterCache = new Map();
+const authoritativeRuntime = new Map();
+let lastAuthoritativeVersion = 0;
+
+function nextAuthoritativeVersion() {
+  const base = Date.now() * 1000;
+  lastAuthoritativeVersion = Math.max(base, lastAuthoritativeVersion + 1);
+  return lastAuthoritativeVersion;
+}
+
+function clamp01(value) {
+  return Math.max(0, Math.min(1, value));
+}
+
+function finitePositive(value, fallback) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function normalizeStoredZone(zone) {
+  const canvasWidth = finitePositive(zone?.canvasWidth, 340);
+  const canvasHeight = finitePositive(zone?.canvasHeight, 230);
+  const x = Number(zone?.x) || 0;
+  const y = Number(zone?.y) || 0;
+  const width = Number(zone?.width) || 0;
+  const height = Number(zone?.height) || 0;
+
+  const xNormalized = Number.isFinite(Number(zone?.xNormalized))
+    ? clamp01(Number(zone.xNormalized))
+    : clamp01(x / canvasWidth);
+  const yNormalized = Number.isFinite(Number(zone?.yNormalized))
+    ? clamp01(Number(zone.yNormalized))
+    : clamp01(y / canvasHeight);
+  const widthNormalized = Number.isFinite(Number(zone?.widthNormalized))
+    ? clamp01(Number(zone.widthNormalized))
+    : clamp01(width / canvasWidth);
+  const heightNormalized = Number.isFinite(Number(zone?.heightNormalized))
+    ? clamp01(Number(zone.heightNormalized))
+    : clamp01(height / canvasHeight);
+
+  return {
+    ...zone,
+    x,
+    y,
+    width,
+    height,
+    xNormalized,
+    yNormalized,
+    widthNormalized,
+    heightNormalized,
+    canvasWidth,
+    canvasHeight,
+    coordinateSpace: "normalized-v1"
+  };
+}
+
+function authoritativeRuntimeKey(shelterId, beaconMac) {
+  return `${String(shelterId || "").trim()}::${normalizeMac(beaconMac)}`;
+}
+
+function getAuthoritativeRuntime(shelterId, beaconMac) {
+  const normalizedBeaconMac = normalizeMac(beaconMac);
+  const key = authoritativeRuntimeKey(shelterId, normalizedBeaconMac);
+
+  if (!authoritativeRuntime.has(key)) {
+    authoritativeRuntime.set(key, {
+      key,
+      shelterId: String(shelterId || "").trim(),
+      beaconMac: normalizedBeaconMac,
+      rowsByGateway: new Map(),
+      memory: createInitialTrackingMemory(),
+      configKey: null,
+      timer: null,
+      staleTimer: null,
+      running: false,
+      dirty: false,
+      lastPayload: null,
+      persistChain: Promise.resolve()
+    });
+  }
+
+  return authoritativeRuntime.get(key);
+}
+
+function rowTimestamp(row) {
+  const timestamp = row?.updated_at ? Date.parse(row.updated_at) : Number.NaN;
+  return Number.isFinite(timestamp) ? timestamp : -Infinity;
+}
+
+function mergeAuthoritativeRow(runtime, value) {
+  const beaconMac = normalizeMac(value?.beacon_mac);
+  const gatewayMac = normalizeMac(value?.gateway_mac);
+  const rssi = Number(value?.rssi);
+  const updatedAt = typeof value?.updated_at === "string" ? value.updated_at : "";
+
+  if (
+    !beaconMac ||
+    beaconMac !== runtime.beaconMac ||
+    !gatewayMac ||
+    !Number.isFinite(rssi) ||
+    !updatedAt
+  ) {
+    return false;
+  }
+
+  const row = {
+    ...value,
+    beacon_mac: beaconMac,
+    gateway_mac: gatewayMac,
+    rssi,
+    updated_at: updatedAt
+  };
+
+  const previous = runtime.rowsByGateway.get(gatewayMac);
+  if (previous && rowTimestamp(previous) > rowTimestamp(row)) {
+    return false;
+  }
+
+  if (
+    previous &&
+    rowTimestamp(previous) === rowTimestamp(row) &&
+    Number(previous.rssi) === Number(row.rssi)
+  ) {
+    return false;
+  }
+
+  runtime.rowsByGateway.set(gatewayMac, row);
+  return true;
+}
+
+function makeShelterConfigKey({gateways, zones, calibrationProfile}) {
+  return JSON.stringify({
+    geometry: buildGatewayGeometrySignature(gateways),
+    zoneCount: zones.length,
+    zones: zones.map(zone => ({
+      name: zone?.name || null,
+      x: zone?.xNormalized ?? null,
+      y: zone?.yNormalized ?? null,
+      width: zone?.widthNormalized ?? null,
+      height: zone?.heightNormalized ?? null
+    })),
+    calibrationVersion: calibrationProfile?.activeModelVersion ?? null,
+    calibrationUpdatedAt: calibrationProfile?.updatedAt ?? null
+  });
+}
+
+async function refreshAuthoritativeShelterConfig(shelterId) {
+  const key = String(shelterId || "").trim();
+  if (!key) return null;
+
+  const existing = authoritativeShelterCache.get(key);
+  if (existing?.promise) {
+    return existing.promise;
+  }
+
+  const promise = (async () => {
+    const [mapResult, gatewayResult] = await Promise.all([
+      supabase
+        .from("shelter_maps")
+        .select("map_zones, map_markers, map_wall_distances, tracking_calibration, map_setup_completed")
+        .eq("shelter_id", key)
+        .maybeSingle(),
+      supabase
+        .from("gateways")
+        .select("id, gateway_name, mac_address, x_position, y_position, status")
+        .eq("shelter_id", key)
+    ]);
+
+    if (mapResult.error) {
+      throw new Error(`Authoritative map config: ${mapResult.error.message}`);
+    }
+    if (gatewayResult.error) {
+      throw new Error(`Authoritative gateway config: ${gatewayResult.error.message}`);
+    }
+
+    const mapRow = mapResult.data || {};
+    const mapMarkers = Array.isArray(mapRow.map_markers) ? mapRow.map_markers : [];
+    const zones = Array.isArray(mapRow.map_zones)
+      ? mapRow.map_zones.map(normalizeStoredZone)
+      : [];
+    const wallDistances = normalizeTrackingWallDistances(mapRow.map_wall_distances || null);
+
+    const placedGatewayIds = new Set(
+      mapMarkers.map(marker => marker?.gateway_id).filter(Boolean)
+    );
+    const placedGatewayMacs = new Set(
+      mapMarkers
+        .map(marker => normalizeTrackingMac(marker?.gateway_mac))
+        .filter(Boolean)
+    );
+
+    const placedRows = (gatewayResult.data || []).filter(row =>
+      placedGatewayIds.has(row.id) ||
+      placedGatewayMacs.has(normalizeTrackingMac(row.mac_address))
+    );
+
+    const gateways = mapTrackingGatewayRows(
+      placedRows,
+      {},
+      {
+        markers: mapMarkers,
+        wallDistances,
+        includeFallbackGateways: false
+      }
+    );
+
+    const profile =
+      mapRow.tracking_calibration && typeof mapRow.tracking_calibration === "object"
+        ? mapRow.tracking_calibration
+        : null;
+
+    const physicalGateway = Object.values(gateways).find(gateway =>
+      typeof gateway.mapWidthMeters === "number" &&
+      typeof gateway.mapHeightMeters === "number"
+    );
+
+    const geometryMatches = Boolean(
+      profile &&
+      profile.version === 2 &&
+      profile.status === "ready" &&
+      physicalGateway &&
+      Math.abs(profile.roomWidthMeters - Number(physicalGateway.mapWidthMeters)) <= 0.01 &&
+      Math.abs(profile.roomHeightMeters - Number(physicalGateway.mapHeightMeters)) <= 0.01 &&
+      profile.gatewayGeometrySignature === buildGatewayGeometrySignature(gateways)
+    );
+
+    const config = {
+      shelterId: key,
+      gateways,
+      zones,
+      calibrationProfile: geometryMatches ? profile : null
+    };
+    config.configKey = makeShelterConfigKey(config);
+
+    authoritativeShelterCache.set(key, {
+      loadedAt: Date.now(),
+      config,
+      promise: null
+    });
+
+    return config;
+  })();
+
+  authoritativeShelterCache.set(key, {
+    loadedAt: existing?.loadedAt || 0,
+    config: existing?.config || null,
+    promise
+  });
+
+  try {
+    return await promise;
+  } finally {
+    const current = authoritativeShelterCache.get(key);
+    if (current?.promise === promise) {
+      authoritativeShelterCache.set(key, {
+        loadedAt: current.loadedAt,
+        config: current.config,
+        promise: null
+      });
+    }
+  }
+}
+
+async function getAuthoritativeShelterConfig(shelterId) {
+  const key = String(shelterId || "").trim();
+  if (!key) return null;
+
+  const existing = authoritativeShelterCache.get(key);
+  const stale =
+    !existing?.loadedAt ||
+    Date.now() - existing.loadedAt >= AUTHORITATIVE_CONFIG_TTL_MS;
+
+  if (existing?.config) {
+    if (stale && !existing.promise) {
+      void refreshAuthoritativeShelterConfig(key).catch(error => {
+        setError(`Authoritative config refresh: ${error?.message || error}`);
+      });
+    }
+    return existing.config;
+  }
+
+  return refreshAuthoritativeShelterConfig(key);
+}
+
+function compactAuthoritativeReading(row) {
+  return {
+    beacon_mac: normalizeMac(row?.beacon_mac),
+    gateway_mac: normalizeMac(row?.gateway_mac),
+    rssi: Number(row?.rssi),
+    raw_rssi: Number(row?.raw_rssi),
+    median_rssi: Number(row?.median_rssi),
+    filtered_rssi: Number(row?.filtered_rssi),
+    updated_at: row?.updated_at || null
+  };
+}
+
+function serializeAuthoritativeResult(runtime, result, memory, now) {
+  return {
+    version: nextAuthoritativeVersion(),
+    shelterId: runtime.shelterId,
+    tenantKey: TENANT_KEY,
+    beaconMac: runtime.beaconMac,
+    computedAt: new Date(now).toISOString(),
+    sourceTimestamp:
+      memory.state.lastPositionSourceTimestamp !== null &&
+      Number.isFinite(Number(memory.state.lastPositionSourceTimestamp))
+        ? Number(memory.state.lastPositionSourceTimestamp)
+        : null,
+    hasEstablishedPosition:
+      memory.state.lastPositionSourceTimestamp !== null,
+    hasSignal:
+      Array.isArray(result.readings) &&
+      result.readings.length > 0 &&
+      Boolean(result.closestGatewayMac),
+    position: result.position,
+    rawPosition: result.rawPosition,
+    physicalPosition: result.physicalPosition || null,
+    closestGatewayMac: result.closestGatewayMac || null,
+    strongestGatewayMac: result.strongestGatewayMac || null,
+    confidenceLabel: result.confidenceLabel,
+    confidenceScore: Number(result.confidenceScore) || 0,
+    confidenceRadiusMeters:
+      typeof result.confidenceRadiusMeters === "number" &&
+      Number.isFinite(result.confidenceRadiusMeters)
+        ? result.confidenceRadiusMeters
+        : null,
+    currentZone: result.currentZone || null,
+    motionState: result.motionState || "unknown",
+    motionSource: result.motionSource || "unknown",
+    motionConfidence:
+      typeof result.motionConfidence === "number" &&
+      Number.isFinite(result.motionConfidence)
+        ? result.motionConfidence
+        : 0,
+    accelerometerDetected: Boolean(result.accelerometerDetected),
+    readings: Array.isArray(result.readings)
+      ? result.readings.map(compactAuthoritativeReading)
+      : [],
+    positionQuality: result.positionQuality ?? null,
+    solverResidualRatio: result.solverResidualRatio ?? null,
+    calibrationBlend: result.calibrationBlend ?? null,
+    probabilisticBlend: result.probabilisticBlend ?? null,
+    probabilisticQuality: result.probabilisticQuality ?? null,
+    frameGatewayCount: result.frameGatewayCount ?? null,
+    frameReady: result.frameReady ?? null,
+    confidenceTargetCoverage: result.confidenceTargetCoverage ?? null,
+    calibrationModelUsed: Boolean(result.calibrationModelUsed),
+    particleFilterUsed: Boolean(result.particleFilterUsed),
+    particleSpreadMeters: result.particleSpreadMeters ?? null,
+    signalCondition: result.signalCondition ?? null,
+    commonSignalBiasDb: result.commonSignalBiasDb ?? null,
+    globalAttenuationDb: result.globalAttenuationDb ?? null,
+    obstructedGatewayCount: result.obstructedGatewayCount ?? null
+  };
+}
+
+async function broadcastAuthoritativePosition(shelterId, payload) {
+  try {
+    const channel = await getTrackingBroadcastChannel(shelterId);
+    if (!channel) return;
+
+    const result = await channel.send({
+      type: "broadcast",
+      event: "tracking-position",
+      payload: {
+        position: payload,
+        receiverSentAt: new Date().toISOString()
+      }
+    });
+
+    if (result !== "ok") {
+      throw new Error(`Authoritative Broadcast send failed: ${result}`);
+    }
+  } catch (error) {
+    setError(`Authoritative Broadcast: ${error?.message || error}`);
+  }
+}
+
+function queueAuthoritativePersistence(runtime, payload) {
+  runtime.persistChain = runtime.persistChain
+    .catch(() => {})
+    .then(async () => {
+      const sourceTimestamp =
+        Number.isFinite(Number(payload.sourceTimestamp)) &&
+        Number(payload.sourceTimestamp) > 0
+          ? new Date(Number(payload.sourceTimestamp)).toISOString()
+          : null;
+
+      const {error} = await supabase
+        .from(AUTHORITATIVE_POSITION_TABLE)
+        .upsert(
+          {
+            shelter_id: runtime.shelterId,
+            beacon_mac: runtime.beaconMac,
+            tenant_key: TENANT_KEY,
+            version: payload.version,
+            source_timestamp: sourceTimestamp,
+            result_payload: payload,
+            updated_at: payload.computedAt
+          },
+          {
+            onConflict: "shelter_id,beacon_mac"
+          }
+        );
+
+      if (error) {
+        throw new Error(`Authoritative position save: ${error.message}`);
+      }
+    })
+    .catch(error => {
+      setError(error);
+    });
+}
+
+function clearAuthoritativeStaleTimer(runtime) {
+  if (runtime.staleTimer !== null) {
+    clearTimeout(runtime.staleTimer);
+    runtime.staleTimer = null;
+  }
+}
+
+function scheduleAuthoritativeStaleCheck(runtime, payload) {
+  clearAuthoritativeStaleTimer(runtime);
+
+  if (!payload.hasSignal) return;
+
+  const newestTimestamp = Math.max(
+    ...Array.from(runtime.rowsByGateway.values())
+      .map(rowTimestamp)
+      .filter(Number.isFinite)
+  );
+
+  if (!Number.isFinite(newestTimestamp)) return;
+
+  const delay = Math.max(
+    50,
+    newestTimestamp + DEFAULT_TRACKING_CONFIG.maxReadingAgeMs + 75 - Date.now()
+  );
+
+  runtime.staleTimer = setTimeout(() => {
+    runtime.staleTimer = null;
+    runtime.dirty = true;
+    scheduleAuthoritativeCalculation(runtime, 0);
+  }, delay);
+  runtime.staleTimer.unref?.();
+}
+
+function scheduleAuthoritativeCalculation(runtime, delay = AUTHORITATIVE_BATCH_MS) {
+  if (runtime.timer !== null || runtime.running) {
+    runtime.dirty = true;
+    return;
+  }
+
+  runtime.timer = setTimeout(() => {
+    runtime.timer = null;
+    void runAuthoritativeCalculation(runtime);
+  }, Math.max(0, delay));
+  runtime.timer.unref?.();
+}
+
+async function runAuthoritativeCalculation(runtime) {
+  if (runtime.running) {
+    runtime.dirty = true;
+    return;
+  }
+
+  runtime.running = true;
+  runtime.dirty = false;
+
+  try {
+    const config = await getAuthoritativeShelterConfig(runtime.shelterId);
+    if (!config || Object.keys(config.gateways || {}).length === 0) {
+      return;
+    }
+
+    if (runtime.configKey !== config.configKey) {
+      runtime.memory = createInitialTrackingMemory();
+      runtime.configKey = config.configKey;
+    }
+
+    const now = Date.now();
+    const rows = Array.from(runtime.rowsByGateway.values());
+    const {result, memory} = calculateTrackingResult({
+      readings: rows,
+      gateways: config.gateways,
+      zones: config.zones,
+      memory: runtime.memory,
+      calibrationProfile: config.calibrationProfile,
+      now
+    });
+
+    runtime.memory = memory;
+    const payload = serializeAuthoritativeResult(runtime, result, memory, now);
+    runtime.lastPayload = payload;
+
+    // Fast path first. Never wait for the database before telling phones the
+    // already-computed authoritative result.
+    void broadcastAuthoritativePosition(runtime.shelterId, payload);
+
+    // Persistence is ordered per beacon but runs independently of calculation.
+    // This gives newly-opened phones the exact same latest result after reload.
+    queueAuthoritativePersistence(runtime, payload);
+    scheduleAuthoritativeStaleCheck(runtime, payload);
+  } catch (error) {
+    setError(`Authoritative tracking: ${error?.message || error}`);
+  } finally {
+    runtime.running = false;
+
+    if (runtime.dirty) {
+      runtime.dirty = false;
+      scheduleAuthoritativeCalculation(runtime);
+    }
+  }
+}
+
+function ingestAuthoritativeRows(shelterId, rows) {
+  const normalizedShelterId = String(shelterId || "").trim();
+  if (!normalizedShelterId || !Array.isArray(rows) || rows.length === 0) {
+    return;
+  }
+
+  rows.forEach(row => {
+    const beaconMac = normalizeMac(row?.beacon_mac);
+    if (!beaconMac) return;
+
+    const runtime = getAuthoritativeRuntime(normalizedShelterId, beaconMac);
+    if (mergeAuthoritativeRow(runtime, row)) {
+      clearAuthoritativeStaleTimer(runtime);
+      runtime.dirty = true;
+      scheduleAuthoritativeCalculation(runtime);
+    }
+  });
+}
+
+function preloadAuthoritativeShelterConfigs() {
+  const shelterIds = new Set(
+    Array.from(deviceCache.gateways.values())
+      .map(gateway => String(gateway?.shelter_id || "").trim())
+      .filter(Boolean)
+  );
+
+  shelterIds.forEach(shelterId => {
+    void getAuthoritativeShelterConfig(shelterId).catch(error => {
+      setError(`Authoritative config preload: ${error?.message || error}`);
+    });
+  });
+}
+
 let deviceCache = {
 loadedAt:
 0,
@@ -1177,6 +1776,8 @@ supabase
                shelter_id,
                gateway_name,
                mac_address,
+               x_position,
+               y_position,
                status
              `)
 ]);
@@ -1871,7 +2472,11 @@ row
 
   const shelterId = registeredGateway?.shelter_id;
   if (shelterId) {
+    // Preserve the existing raw-reading Broadcast for staff tracking and
+    // diagnostics, while also feeding the one receiver-side authoritative
+    // animal tracker used by every phone in this shelter.
     void broadcastTrackingRows(shelterId, databaseRows);
+    ingestAuthoritativeRows(shelterId, databaseRows);
   }
 
 liveState.supabaseStatus =
@@ -2462,6 +3067,9 @@ try {
 await loadRegisteredDevices(
 true
 );
+
+// Warm shelter geometry/calibration outside the packet hot path.
+preloadAuthoritativeShelterConfigs();
 
 liveState.supabaseStatus =
 "CONNECTED";
