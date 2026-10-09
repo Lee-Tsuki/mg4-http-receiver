@@ -22,6 +22,8 @@ exports.appendValidationPoint = appendValidationPoint;
 exports.calculateValidationMetrics = calculateValidationMetrics;
 exports.reconcileCalibrationProfile = reconcileCalibrationProfile;
 exports.estimateDynamicConfidenceRadius = estimateDynamicConfidenceRadius;
+exports.skipCalibrationArea = skipCalibrationArea;
+exports.createCustomCalibrationArea = createCustomCalibrationArea;
 const rssiUtils_1 = require("./rssiUtils");
 const trackingConfig_1 = require("./trackingConfig");
 const beaconFrameUtils_1 = require("./beaconFrameUtils");
@@ -471,7 +473,9 @@ function createBootstrapCalibrationAreas(profile) {
 }
 function getNextBootstrapArea(profile) {
     const completedIds = new Set(profile.calibrationPoints.filter(point => point.accepted).map(point => point.area.id));
-    return (createBootstrapCalibrationAreas(profile).find(area => !completedIds.has(area.id)) ||
+    return (createBootstrapCalibrationAreas(profile)
+        .map(area => profile.bootstrapAreaOverrides?.[area.id] || area)
+        .find(area => !completedIds.has(area.id)) ||
         null);
 }
 function rbfKernel(ax, ay, bx, by, amplitudeDb, lengthScaleMeters) {
@@ -583,6 +587,36 @@ function buildGatewayTrainingSamples({ profile, gatewayMac, gateway, }) {
     })
         .filter(Boolean);
 }
+const preparedCalibration = new WeakMap();
+function prepareGatewayCalibration(profile, gatewayMac, gateway) {
+    const revision = `${profile.activeModelVersion}:${profile.updatedAt}:${profile.referenceVerticalSeparationMeters}:${profile.roomWidthMeters}:${profile.roomHeightMeters}`;
+    let cache = preparedCalibration.get(profile);
+    if (!cache || cache.revision !== revision || cache.points !== profile.calibrationPoints) {
+        cache = { revision, points: profile.calibrationPoints, gateways: new Map() };
+        preparedCalibration.set(profile, cache);
+    }
+    const key = JSON.stringify([normalizeMac(gatewayMac), gateway.xMeters, gateway.yMeters,
+        gateway.txPowerAt1m, gateway.pathLossExponent]);
+    const existing = cache.gateways.get(key);
+    if (existing)
+        return existing;
+    const samples = buildGatewayTrainingSamples({ profile, gatewayMac, gateway });
+    const lengthScale = clamp(Math.hypot(profile.roomWidthMeters, profile.roomHeightMeters) * 0.28, 0.45, 2.4);
+    const amplitude = 9;
+    const n = samples.length;
+    const matrix = Array.from({ length: n }, () => Array(n).fill(0));
+    for (let i = 0; i < n; i += 1) {
+        for (let j = 0; j < n; j += 1) {
+            matrix[i][j] = rbfKernel(samples[i].xMeters, samples[i].yMeters, samples[j].xMeters, samples[j].yMeters, amplitude, lengthScale);
+        }
+        matrix[i][i] += samples[i].noiseVarianceDb2 + 1e-4;
+    }
+    const lower = cholesky(matrix);
+    const prepared = { samples, lengthScale, amplitude, lower,
+        alpha: lower ? solveCholesky(lower, samples.map(sample => sample.residualDb)) : [] };
+    cache.gateways.set(key, prepared);
+    return prepared;
+}
 function predictGatewayCalibrationAdjustment({ profile, gatewayMac, gateway, xMeters, yMeters, }) {
     if (!profile || profile.calibrationPoints.length === 0) {
         return {
@@ -592,10 +626,8 @@ function predictGatewayCalibrationAdjustment({ profile, gatewayMac, gateway, xMe
             support: 0,
         };
     }
-    const samples = buildGatewayTrainingSamples({ profile, gatewayMac, gateway });
-    const roomDiagonal = Math.hypot(profile.roomWidthMeters, profile.roomHeightMeters);
-    const lengthScale = clamp(roomDiagonal * 0.28, 0.45, 2.4);
-    const amplitude = 9;
+    const prepared = prepareGatewayCalibration(profile, gatewayMac, gateway);
+    const { samples, lengthScale, amplitude } = prepared;
     if (samples.length === 0) {
         return {
             meanCorrectionDb: 0,
@@ -616,15 +648,7 @@ function predictGatewayCalibrationAdjustment({ profile, gatewayMac, gateway, xMe
             support,
         };
     }
-    const n = samples.length;
-    const matrix = Array.from({ length: n }, () => Array(n).fill(0));
-    for (let i = 0; i < n; i += 1) {
-        for (let j = 0; j < n; j += 1) {
-            matrix[i][j] = rbfKernel(samples[i].xMeters, samples[i].yMeters, samples[j].xMeters, samples[j].yMeters, amplitude, lengthScale);
-        }
-        matrix[i][i] += samples[i].noiseVarianceDb2 + 1e-4;
-    }
-    const lower = cholesky(matrix);
+    const { lower, alpha } = prepared;
     if (!lower) {
         const weighted = samples.map(sample => {
             const distance = Math.hypot(xMeters - sample.xMeters, yMeters - sample.yMeters);
@@ -642,8 +666,6 @@ function predictGatewayCalibrationAdjustment({ profile, gatewayMac, gateway, xMe
             support,
         };
     }
-    const targets = samples.map(sample => sample.residualDb);
-    const alpha = solveCholesky(lower, targets);
     const kStar = samples.map(sample => rbfKernel(sample.xMeters, sample.yMeters, xMeters, yMeters, amplitude, lengthScale));
     const meanPrediction = kStar.reduce((sum, kernelValue, index) => sum + kernelValue * alpha[index], 0);
     const v = solveLower(lower, kStar);
@@ -682,6 +704,13 @@ function suggestNextCalibrationArea({ profile, gateways, kind = 'active', }) {
                 (yi / (gridSize - 1)) * Math.max(0, 1 - 2 * marginY);
             const xMeters = xNormalized * width;
             const yMeters = yNormalized * height;
+            if ((profile.skippedAreas || []).some(area => Math.hypot(xMeters - area.xMeters, yMeters - area.yMeters) <=
+                Math.max(radius, area.placementRadiusMeters)))
+                continue;
+            // A blind validation must stay separate from accepted training captures.
+            if (kind === 'validation' && existing.some(point => Math.hypot(xMeters - point.area.xMeters, yMeters - point.area.yMeters) <
+                Math.max(radius, point.area.placementRadiusMeters)))
+                continue;
             const nearestExisting = existing.length
                 ? Math.min(...existing.map(point => Math.hypot(xMeters - point.area.xMeters, yMeters - point.area.yMeters)))
                 : Math.hypot(width, height);
@@ -714,7 +743,11 @@ function suggestNextCalibrationArea({ profile, gateways, kind = 'active', }) {
             }
         }
     }
-    const index = profile.calibrationPoints.length + profile.validationPoints.length + 1;
+    if (!Number.isFinite(best.score)) {
+        throw new Error('No remaining suggested area is accessible. Review the map dimensions or reset calibration to clear skipped locations.');
+    }
+    const index = profile.calibrationPoints.length + profile.validationPoints.length +
+        (profile.skippedAreas?.length || 0) + 1;
     return {
         id: `${kind}-${index}-${Math.round(best.xNormalized * 1000)}-${Math.round(best.yNormalized * 1000)}`,
         kind,
@@ -966,4 +999,44 @@ function estimateDynamicConfidenceRadius({ profile, solverSpreadMeters, position
         maturityPenalty *
         (1 + 0.7 * (1 - quality)) *
         obstructionExpansion, profile.defaultPlacementRadiusMeters, Math.max(profile.defaultPlacementRadiusMeters, diagonal * 0.7));
+}
+/** Replace an inaccessible suggestion without changing completion requirements. */
+function skipCalibrationArea(profile, area, gateways) {
+    if (area.kind === 'gateway-anchor') {
+        throw new Error('Gateway anchors cannot be skipped.');
+    }
+    const next = { ...profile, skippedAreas: [...(profile.skippedAreas || []), area] };
+    const suggested = suggestNextCalibrationArea({
+        profile: next, gateways, kind: area.kind === 'validation' ? 'validation' : 'active',
+    });
+    const replacement = area.kind === 'bootstrap'
+        ? { ...suggested, id: area.id, order: area.order, kind: area.kind }
+        : suggested;
+    return {
+        profile: {
+            ...next,
+            bootstrapAreaOverrides: area.kind === 'bootstrap'
+                ? { ...profile.bootstrapAreaOverrides, [area.id]: replacement }
+                : profile.bootstrapAreaOverrides,
+            updatedAt: new Date().toISOString(),
+        },
+        area: replacement,
+    };
+}
+function createCustomCalibrationArea({ profile, horizontalWall, horizontalMeters, verticalWall, verticalMeters, }) {
+    const width = profile.roomWidthMeters;
+    const height = profile.roomHeightMeters;
+    if (![width, height, horizontalMeters, verticalMeters].every(Number.isFinite) ||
+        width <= 0 || height <= 0 || horizontalMeters < 0 || horizontalMeters > width ||
+        verticalMeters < 0 || verticalMeters > height) {
+        throw new Error(`Enter distances within the shelter: horizontal 0–${width} m and vertical 0–${height} m.`);
+    }
+    const xMeters = horizontalWall === 'left' ? horizontalMeters : width - horizontalMeters;
+    const yMeters = verticalWall === 'top' ? verticalMeters : height - verticalMeters;
+    return {
+        id: `custom-${Date.now()}-${profile.calibrationPoints.length + 1}`,
+        kind: 'active', order: profile.calibrationPoints.length + 1,
+        xMeters, yMeters, xNormalized: xMeters / width, yNormalized: yMeters / height,
+        placementRadiusMeters: profile.defaultPlacementRadiusMeters,
+    };
 }

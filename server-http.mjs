@@ -5,6 +5,7 @@ import { createRequire } from "node:module";
 import { createClient } from "@supabase/supabase-js";
 
 const require = createRequire(import.meta.url);
+const {createPositionTransition, createLatestWriter} = require("./tracking/liveDelivery.js");
 const {
   createInitialTrackingMemory,
   calculateTrackingResult
@@ -88,7 +89,7 @@ const PACKET_RATE_WINDOW_MS = 5000;
 
 const AUTHORITATIVE_BATCH_MS = Math.max(
   10,
-  Number(process.env.AUTHORITATIVE_BATCH_MS || 35)
+  Number(process.env.AUTHORITATIVE_BATCH_MS || 15)
 );
 
 const AUTHORITATIVE_CONFIG_TTL_MS = Math.max(
@@ -1278,7 +1279,8 @@ function getAuthoritativeRuntime(shelterId, beaconMac) {
       running: false,
       dirty: false,
       lastPayload: null,
-      persistChain: Promise.resolve()
+      persistLatest: null,
+      broadcastLatest: null
     });
   }
 
@@ -1557,6 +1559,7 @@ function serializeAuthoritativeResult(runtime, result, memory, now) {
       result.readings.length > 0 &&
       Boolean(result.closestGatewayMac),
     position: result.position,
+    transition: createPositionTransition(runtime.lastPayload, result.position, now),
     rawPosition: result.rawPosition,
     physicalPosition: result.physicalPosition || null,
     closestGatewayMac: result.closestGatewayMac || null,
@@ -1618,48 +1621,29 @@ async function broadcastAuthoritativePosition(shelterId, payload) {
   } catch (error) {
     setAuthoritativeError(`Authoritative Broadcast: ${error?.message || error}`);
     setError(`Authoritative Broadcast: ${error?.message || error}`);
+    throw error;
   }
 }
 
 function queueAuthoritativePersistence(runtime, payload) {
-  runtime.persistChain = runtime.persistChain
-    .catch(() => {})
-    .then(async () => {
-      const sourceTimestamp =
-        Number.isFinite(Number(payload.sourceTimestamp)) &&
-        Number(payload.sourceTimestamp) > 0
-          ? new Date(Number(payload.sourceTimestamp)).toISOString()
-          : null;
-
-      const {error} = await supabase
-        .from(AUTHORITATIVE_POSITION_TABLE)
-        .upsert(
-          {
-            shelter_id: runtime.shelterId,
-            beacon_mac: runtime.beaconMac,
-            tenant_key: TENANT_KEY,
-            version: payload.version,
-            source_timestamp: sourceTimestamp,
-            result_payload: payload,
-            updated_at: payload.computedAt
-          },
-          {
-            onConflict: "shelter_id,beacon_mac"
-          }
-        );
-
-      if (error) {
-        throw new Error(`Authoritative position save: ${error.message}`);
-      }
-
+  if (!runtime.persistLatest) {
+    runtime.persistLatest = createLatestWriter(async current => {
+      const sourceTimestamp = Number.isFinite(Number(current.sourceTimestamp)) &&
+        Number(current.sourceTimestamp) > 0
+          ? new Date(Number(current.sourceTimestamp)).toISOString() : null;
+      const {error} = await supabase.from(AUTHORITATIVE_POSITION_TABLE).upsert({
+        shelter_id: runtime.shelterId, beacon_mac: runtime.beaconMac,
+        tenant_key: TENANT_KEY, version: current.version,
+        source_timestamp: sourceTimestamp, result_payload: current,
+        updated_at: current.computedAt,
+      }, {onConflict: "shelter_id,beacon_mac"});
+      if (error) throw new Error(`Authoritative position save: ${error.message}`);
       liveState.authoritativeSaves++;
       liveState.authoritativeLastSaveAt = Date.now();
       liveState.authoritativeLastError = null;
-    })
-    .catch(error => {
-      setAuthoritativeError(error);
-      setError(error);
-    });
+    }, error => {setAuthoritativeError(error); setError(error);});
+  }
+  runtime.persistLatest(payload);
 }
 
 function clearAuthoritativeStaleTimer(runtime) {
@@ -1730,6 +1714,7 @@ async function runAuthoritativeCalculation(runtime) {
 
     if (runtime.configKey !== config.configKey) {
       runtime.memory = createInitialTrackingMemory();
+      runtime.lastPayload = null;
       runtime.configKey = config.configKey;
     }
 
@@ -1745,7 +1730,7 @@ async function runAuthoritativeCalculation(runtime) {
     });
 
     runtime.memory = memory;
-    const payload = serializeAuthoritativeResult(runtime, result, memory, now);
+    const payload = serializeAuthoritativeResult(runtime, result, memory, Date.now());
     runtime.lastPayload = payload;
     liveState.authoritativeCalculations++;
     liveState.authoritativeLastAt = now;
@@ -1754,9 +1739,15 @@ async function runAuthoritativeCalculation(runtime) {
 
     // Fast path first. Never wait for the database before telling phones the
     // already-computed authoritative result.
-    void broadcastAuthoritativePosition(runtime.shelterId, payload);
+    if (!runtime.broadcastLatest) {
+      runtime.broadcastLatest = createLatestWriter(
+        current => broadcastAuthoritativePosition(runtime.shelterId, current),
+        error => setAuthoritativeError(error),
+      );
+    }
+    runtime.broadcastLatest(payload);
 
-    // Persistence is ordered per beacon but runs independently of calculation.
+    // Persistence is ordered and coalesced per beacon, independently of calculation.
     // This gives newly-opened phones the exact same latest result after reload.
     queueAuthoritativePersistence(runtime, payload);
     scheduleAuthoritativeStaleCheck(runtime, payload);

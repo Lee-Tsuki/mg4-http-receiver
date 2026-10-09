@@ -3,128 +3,93 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.createInitialMotionTrackingState = createInitialMotionTrackingState;
 exports.updateMotionTracking = updateMotionTracking;
 const beaconFrameUtils_1 = require("./beaconFrameUtils");
-function clamp(value, min, max) {
-    return Math.max(min, Math.min(max, value));
-}
-function sourceTimestamp(reading, now) {
-    const parsed = reading.updated_at ? Date.parse(reading.updated_at) : now;
-    return Number.isFinite(parsed) ? parsed : now;
-}
 function createInitialMotionTrackingState() {
     return {
-        state: 'unknown',
-        source: 'unknown',
-        confidence: 0,
-        accelerometerSeen: false,
-        lastAccelerometerMotionAt: null,
-        lastAccelerometerFrameAt: null,
-        updatedAt: null,
+        state: 'unknown', source: 'unknown', confidence: 0,
+        accelerometerSeen: false, lastAccelerometerMotionAt: null,
+        lastAccelerometerFrameAt: null, updatedAt: null,
     };
 }
-function updateMotionTracking({ readings, previous, now, config, trackingStationary, positionSpeedMetersPerSecond, }) {
+function median(values) {
+    const sorted = [...values].sort((a, b) => a - b);
+    const middle = Math.floor(sorted.length / 2);
+    return sorted.length % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2;
+}
+/** ACC describes collar activity. Only fresh, coherent RF displacement proves travel. */
+function updateMotionTracking({ readings, previous, now, config, trackingStationary, observation, }) {
     const prior = previous || createInitialMotionTrackingState();
-    let freshAccelerometerFrame = false;
-    let explicitMovingEvidence = false;
-    let explicitStationaryEvidence = false;
-    let newestAccelerometerAt = null;
-    readings.forEach(reading => {
-        const timestamp = sourceTimestamp(reading, now);
-        if (now - timestamp > config.motionEvidenceFreshMs)
-            return;
+    let next = { ...prior, updatedAt: now };
+    for (const reading of readings) {
+        const timestamp = Date.parse(reading.updated_at || '');
+        if (!Number.isFinite(timestamp) || now - timestamp > config.motionEvidenceFreshMs || timestamp > now + 1000)
+            continue;
         const evidence = (0, beaconFrameUtils_1.extractMotionEvidence)(reading.raw_payload);
         if (!evidence.hasAccelerometerFrame)
-            return;
-        freshAccelerometerFrame = true;
-        newestAccelerometerAt = Math.max(newestAccelerometerAt || 0, timestamp);
-        if (evidence.explicitMoving === true)
-            explicitMovingEvidence = true;
-        if (evidence.explicitMoving === false)
-            explicitStationaryEvidence = true;
-    });
-    if (freshAccelerometerFrame) {
-        // Only an explicit activity flag is strong enough to override the
-        // software tracker. A raw ACC frame without that flag is deliberately
-        // neutral; otherwise every periodic ACC packet would be interpreted as
-        // movement.
-        if (explicitMovingEvidence) {
-            return {
-                state: 'moving',
-                source: 'accelerometer',
-                confidence: 0.98,
-                accelerometerSeen: true,
-                lastAccelerometerMotionAt: newestAccelerometerAt,
-                lastAccelerometerFrameAt: newestAccelerometerAt,
-                updatedAt: now,
-            };
+            continue;
+        next.accelerometerSeen = true;
+        next.lastAccelerometerFrameAt = Math.max(next.lastAccelerometerFrameAt || 0, timestamp);
+        if (evidence.explicitMoving === true) {
+            next.lastAccelerometerMotionAt = Math.max(next.lastAccelerometerMotionAt || 0, timestamp);
         }
-        if (explicitStationaryEvidence) {
-            return {
-                state: 'stationary',
-                source: 'accelerometer',
-                confidence: 0.96,
-                accelerometerSeen: true,
-                lastAccelerometerMotionAt: prior.lastAccelerometerMotionAt,
-                lastAccelerometerFrameAt: newestAccelerometerAt,
-                updatedAt: now,
-            };
+    }
+    // Duplicate packets/polls and ACC-only packets cannot vote for travel.
+    if (!observation || !Number.isFinite(observation.timestamp) ||
+        observation.timestamp <= (prior.translation?.timestamp ?? -Infinity) ||
+        observation.quality < config.motionMinimumPositionQuality) {
+        return { ...next, state: prior.state === 'unknown' && trackingStationary ? 'stationary' : prior.state };
+    }
+    const o = observation;
+    const rows = o.gateways.filter(g => Number.isFinite(g.rssi) && Number.isFinite(g.timestamp));
+    if (rows.length < 3 && !prior.translation)
+        return next;
+    const anchor = prior.translation;
+    const freshCount = rows.filter(g => g.timestamp > (anchor?.seen[g.mac] ?? -Infinity)).length;
+    if (freshCount < 2)
+        return next;
+    const seen = Object.fromEntries(rows.map(g => [g.mac, g.timestamp]));
+    const baseline = Object.fromEntries(rows.map(g => [g.mac, g.rssi]));
+    if (!anchor) {
+        return { ...next, state: 'stationary', source: 'tracking', confidence: 0.60,
+            translation: { xMeters: o.xMeters, yMeters: o.yMeters, baseline, seen,
+                timestamp: o.timestamp, lastProgressAt: o.timestamp, candidate: null } };
+    }
+    const dx = o.xMeters - anchor.xMeters;
+    const dy = o.yMeters - anchor.yMeters;
+    const distance = Math.hypot(dx, dy);
+    const changes = rows.filter(g => Number.isFinite(anchor.baseline[g.mac]))
+        .map(g => g.rssi - anchor.baseline[g.mac]);
+    // Median common-mode removal rejects global attenuation AND a single bad path.
+    const common = changes.length ? median(changes) : 0;
+    const moving = prior.state === 'moving';
+    const relativeThreshold = moving ? Math.min(0.4, config.motionRelativeRssiThresholdDb) : config.motionRelativeRssiThresholdDb;
+    const changedPaths = changes.filter(delta => Math.abs(delta - common) >= relativeThreshold).length;
+    const threshold = moving ? config.motionContinueDistanceMeters : config.motionStartDistanceMeters;
+    const supportsTravel = distance >= threshold && changedPaths >= 2;
+    const translation = { ...anchor, seen, timestamp: o.timestamp };
+    if (supportsTravel) {
+        const old = anchor.candidate;
+        const norm = old ? Math.hypot(old.dx, old.dy) * distance : 0;
+        const consistent = Boolean(old && norm > 0 && (old.dx * dx + old.dy * dy) / norm >= 0.65 &&
+            o.timestamp - old.startedAt <= config.motionEvidenceFreshMs * 2);
+        const candidate = consistent && old
+            ? { ...old, count: old.count + 1, dx, dy }
+            : { dx, dy, count: 1, startedAt: o.timestamp };
+        const confirmed = moving || (candidate.count >= config.motionTranslationFrames &&
+            o.timestamp - candidate.startedAt >= config.motionTranslationMinSpanMs);
+        if (confirmed) {
+            return { ...next, state: 'moving', source: 'tracking', confidence: 0.80,
+                translation: { ...translation, xMeters: o.xMeters, yMeters: o.yMeters,
+                    baseline, lastProgressAt: o.timestamp, candidate: null } };
         }
-        // ACC frame present, but no explicit activity flag. Preserve an already
-        // known state so sensor packets do not cause a false transition. If the
-        // app has not learned an ACC state yet, use the existing position-speed
-        // estimate rather than inventing accelerometer truth.
-        const fallbackMoving = positionSpeedMetersPerSecond >= config.motionTrackingSpeedThresholdMps;
-        const fallbackState = prior.state !== 'unknown'
-            ? prior.state
-            : fallbackMoving
-                ? 'moving'
-                : trackingStationary
-                    ? 'stationary'
-                    : 'unknown';
-        return {
-            ...prior,
-            state: fallbackState,
-            source: fallbackState === prior.state && prior.source !== 'unknown'
-                ? prior.source
-                : 'tracking',
-            confidence: fallbackState === 'unknown' ? 0.2 : 0.58,
-            accelerometerSeen: true,
-            lastAccelerometerFrameAt: newestAccelerometerAt,
-            updatedAt: now,
-        };
+        return { ...next, state: 'stationary', source: 'tracking', confidence: 0.65,
+            translation: { ...translation, candidate } };
     }
-    const lastMotionAt = prior.lastAccelerometerMotionAt;
-    if (prior.accelerometerSeen &&
-        lastMotionAt !== null &&
-        now - lastMotionAt >= config.motionStationaryAfterMs) {
-        return {
-            ...prior,
-            state: 'stationary',
-            source: 'accelerometer',
-            confidence: 0.9,
-            updatedAt: now,
-        };
+    if (moving && o.timestamp - anchor.lastProgressAt < config.motionStopHoldMs) {
+        return { ...next, state: 'moving', source: 'tracking', confidence: 0.65,
+            translation: { ...translation, candidate: null } };
     }
-    // No ACC frame has ever reached the app yet. Keep the existing tracker useful
-    // by exposing a clearly-labeled software estimate instead of pretending it is
-    // accelerometer truth.
-    let state = 'unknown';
-    let source = 'unknown';
-    let confidence = 0;
-    if (trackingStationary) {
-        state = 'stationary';
-        source = 'tracking';
-        confidence = 0.7;
-    }
-    else if (positionSpeedMetersPerSecond >= config.motionTrackingSpeedThresholdMps) {
-        state = 'moving';
-        source = 'tracking';
-        confidence = clamp(0.55 + positionSpeedMetersPerSecond / Math.max(0.5, config.maxPositionSpeedMps) * 0.25, 0.55, 0.82);
-    }
-    return {
-        ...prior,
-        state,
-        source,
-        confidence,
-        updatedAt: now,
-    };
+    // Keep the stationary RF anchor fixed: repeated small fluctuations must not
+    // accumulate into a walk. On stopping, establish the new stationary anchor.
+    return { ...next, state: 'stationary', source: 'tracking', confidence: 0.75,
+        translation: { ...translation, ...(moving ? { xMeters: o.xMeters, yMeters: o.yMeters, baseline } : {}), candidate: null } };
 }

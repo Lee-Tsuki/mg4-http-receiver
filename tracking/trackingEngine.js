@@ -199,7 +199,7 @@ function positionDistanceRatio({ from, to, calibratedGateway, }) {
 }
 function updateStationaryTracking({ previousState, rawPosition, calibratedGateway, config, motionState = 'unknown', }) {
     const state = previousState || createInitialStationaryState();
-    // Direct accelerometer movement evidence should immediately release a stale
+    // Confirmed RF translation should immediately release a stale
     // stationary lock. This does not move the marker by itself; it only allows
     // the existing position evidence to move it again.
     if (motionState === 'moving' && state.isStationary) {
@@ -216,7 +216,7 @@ function updateStationaryTracking({ previousState, rawPosition, calibratedGatewa
             released: true,
         };
     }
-    // While a fresh ACC frame says the tag is moving, do not create a new
+    // While RF confirms translation, do not create a new
     // stationary lock from a few coincidentally similar RSSI estimates.
     if (motionState === 'moving' && !state.isStationary) {
         return {
@@ -472,6 +472,14 @@ function calculateTrackingResult({ readings, gateways, zones, memory, config = t
         ...trackingConfig_1.DEFAULT_TRACKING_CONFIG,
         ...config,
     };
+    // A long signal gap invalidates the old motion/particle anchor. Reacquire
+    // from current measurements instead of pinning a returned beacon to its old fix.
+    const newestInputTimestamp = Math.max(...readings.map(row => Date.parse(row.updated_at || '')).filter(Number.isFinite));
+    if (memory.state.lastPositionSourceTimestamp != null &&
+        newestInputTimestamp - memory.state.lastPositionSourceTimestamp > mergedConfig.maxReadingAgeMs &&
+        now - newestInputTimestamp <= mergedConfig.maxReadingAgeMs) {
+        memory = createInitialTrackingMemory();
+    }
     const effectiveCalibrationProfile = calibrationProfile === undefined
         ? (0, calibrationRuntime_1.getActiveTrackingCalibrationProfile)()
         : calibrationProfile;
@@ -485,30 +493,7 @@ function calculateTrackingResult({ readings, gateways, zones, memory, config = t
     });
     const activeReadings = filtered.readings.filter(row => gateways[row.gateway_mac]);
     const calibratedGateway = getCalibratedGateway(gateways);
-    const previousVelocityForMotion = memory.state.positionVelocity || { x: 0, y: 0 };
-    const motionTracking = (0, motionEngine_1.updateMotionTracking)({
-        readings,
-        previous: memory.state.motionTracking,
-        now,
-        config: mergedConfig,
-        trackingStationary: Boolean(memory.state.stationaryTracking?.isStationary),
-        positionSpeedMetersPerSecond: physicalSpeedMetersPerSecond({
-            velocity: previousVelocityForMotion,
-            calibratedGateway,
-        }),
-    });
-    const moving = motionTracking.state === 'moving';
-    const startedMoving = moving &&
-        (memory.state.lastPositionMotionState ?? memory.state.motionTracking?.state) !==
-            'moving';
-    const temporalConfig = moving
-        ? {
-            ...mergedConfig,
-            positionHistorySize: Math.max(1, Math.min(mergedConfig.positionHistorySize, mergedConfig.movingPositionHistorySize ?? 2)),
-            positionDeadbandRatio: mergedConfig.positionDeadbandRatio *
-                clamp(mergedConfig.movingPositionDeadbandScale ?? 0.25, 0, 1),
-        }
-        : mergedConfig;
+    let motionTracking = memory.state.motionTracking || (0, motionEngine_1.createInitialMotionTrackingState)();
     const frame = buildMeasurementFrame({
         readings: activeReadings,
         config: mergedConfig,
@@ -634,6 +619,28 @@ function calculateTrackingResult({ readings, gateways, zones, memory, config = t
                 ? Math.max(1, mergedConfig.sparseConfidenceExpansion)
                 : 1)
         : null;
+    // Use the unsmoothed calibrated estimate for travel evidence. Looking at
+    // displayed velocity here would create a stationary-lock feedback loop.
+    motionTracking = (0, motionEngine_1.updateMotionTracking)({
+        readings, previous: memory.state.motionTracking, now, config: mergedConfig,
+        trackingStationary: Boolean(memory.state.stationaryTracking?.isStationary),
+        positionSpeedMetersPerSecond: physicalSpeedMetersPerSecond({ velocity: previousVelocity, calibratedGateway }),
+        observation: hasNewSourceData && calibratedGateway && newestSourceTimestamp !== null
+            ? {
+                xMeters: estimate.position.x / 100 * calibratedGateway.mapWidthMeters,
+                yMeters: estimate.position.y / 100 * calibratedGateway.mapHeightMeters,
+                timestamp: newestSourceTimestamp, quality: effectivePositionQuality,
+                gateways: frame.readings.map(row => ({ mac: row.gateway_mac,
+                    timestamp: row.source_timestamp, rssi: row.packet_rssi ?? row.rssi })),
+            }
+            : null,
+    });
+    const moving = motionTracking.state === 'moving';
+    const startedMoving = moving && memory.state.lastPositionMotionState !== 'moving';
+    const temporalConfig = moving
+        ? { ...mergedConfig, positionHistorySize: Math.max(1, mergedConfig.movingPositionHistorySize ?? 1),
+            positionDeadbandRatio: mergedConfig.positionDeadbandRatio * (mergedConfig.movingPositionDeadbandScale ?? 0.08) }
+        : mergedConfig;
     let nextParticleFilter = memory.state.particleFilter || (0, particleFilter_1.createInitialParticleFilterState)();
     let particleEstimate = null;
     if (mergedConfig.particleFilterEnabled &&
@@ -642,7 +649,7 @@ function calculateTrackingResult({ readings, gateways, zones, memory, config = t
         hasNewSourceData &&
         newestSourceTimestamp !== null) {
         particleEstimate = (0, particleFilter_1.updateParticleFilter)({
-            previous: nextParticleFilter,
+            previous: startedMoving ? (0, particleFilter_1.createInitialParticleFilterState)() : nextParticleFilter,
             observation: estimate.position,
             widthMeters: calibratedGateway.mapWidthMeters,
             heightMeters: calibratedGateway.mapHeightMeters,
@@ -655,7 +662,12 @@ function calculateTrackingResult({ readings, gateways, zones, memory, config = t
         });
         nextParticleFilter = particleEstimate.state;
     }
-    const rawPosition = clampPosition(particleEstimate?.position || estimate.position);
+    // Once travel is confirmed, retain the particle posterior as a secondary
+    // opinion rather than stacking its full lag on the already filtered RF fix.
+    const rawPosition = clampPosition(moving && particleEstimate
+        ? { x: estimate.position.x * 0.8 + particleEstimate.position.x * 0.2,
+            y: estimate.position.y * 0.8 + particleEstimate.position.y * 0.2 }
+        : particleEstimate?.position || estimate.position);
     if (particleEstimate) {
         const particleRadius = Math.max(mergedConfig.particleObservationSigmaFloorMeters, particleEstimate.spreadMeters * 1.8);
         effectiveConfidenceRadiusMeters =
@@ -688,8 +700,8 @@ function calculateTrackingResult({ readings, gateways, zones, memory, config = t
     let smoothedPosition = previousPosition;
     let nextVelocity = previousVelocity;
     let nextStationaryState = memory.state.stationaryTracking || createInitialStationaryState();
-    // Release the anchor as soon as motion is known, even between RF frames.
-    // Position, particles and history still advance only on a new coherent frame.
+    // Only RF-confirmed translation can release this anchor; collar activity
+    // alone never broadens the moving particle cloud or unlocks the marker.
     if (moving && nextStationaryState.isStationary) {
         nextStationaryState = createInitialStationaryState();
     }
@@ -709,13 +721,29 @@ function calculateTrackingResult({ readings, gateways, zones, memory, config = t
             };
         }
         else {
-            const stationaryDecision = updateStationaryTracking({
-                previousState: nextStationaryState,
-                rawPosition,
-                calibratedGateway,
-                config: mergedConfig,
-                motionState: motionTracking.state,
-            });
+            const justStopped = motionTracking.state === 'stationary' &&
+                memory.state.lastPositionMotionState === 'moving';
+            const stationaryPosition = justStopped
+                ? limitTargetMovement({ previousPosition, targetPosition: estimate.position,
+                    elapsedSeconds: elapsedSecondsForEstimate, calibratedGateway,
+                    config: mergedConfig, positionQuality: effectivePositionQuality }).target
+                : previousPosition;
+            if (motionTracking.state === 'stationary') {
+                nextStationaryState = {
+                    ...createInitialStationaryState(), isStationary: true,
+                    anchorPosition: stationaryPosition, clusterPosition: stationaryPosition,
+                    clusterCount: mergedConfig.stationaryReadingsRequired,
+                };
+            }
+            const stationaryDecision = motionTracking.state === 'stationary'
+                ? { state: nextStationaryState, lockedPosition: stationaryPosition, released: false }
+                : updateStationaryTracking({
+                    previousState: nextStationaryState,
+                    rawPosition,
+                    calibratedGateway,
+                    config: mergedConfig,
+                    motionState: motionTracking.state,
+                });
             nextStationaryState = stationaryDecision.state;
             if (stationaryDecision.released) {
                 nextPositionHistory = [
@@ -791,12 +819,22 @@ function calculateTrackingResult({ readings, gateways, zones, memory, config = t
                         : motionTracking.state === 'stationary'
                             ? 0.82
                             : 1;
-                    const effectiveAlpha = clamp((moving
+                    const frameAlpha = clamp((moving
                         ? mergedConfig.movingPositionSmoothingAlpha ?? 0.65
                         : mergedConfig.positionSmoothingAlpha) *
                         readingCountMultiplier *
                         (0.6 + positionQuality * 0.8) *
                         motionResponsiveness, 0.07, motionTracking.state === 'moving' ? 0.88 : 0.46);
+                    const observedSpeed = physicalSpeedMetersPerSecond({
+                        velocity: { x: (limited.target.x - previousPosition.x) / elapsedSeconds,
+                            y: (limited.target.y - previousPosition.y) / elapsedSeconds }, calibratedGateway,
+                    });
+                    // Speed-adaptive, time-based low-pass gain: respond quickly during
+                    // confirmed travel, retain conservative smoothing when unconfirmed.
+                    const cutoffHz = 1.8 + Math.min(4.2, observedSpeed) * 0.5;
+                    const effectiveAlpha = moving
+                        ? elapsedSeconds / (elapsedSeconds + 1 / (2 * Math.PI * cutoffHz))
+                        : 1 - Math.pow(1 - frameAlpha, elapsedSeconds);
                     smoothedPosition = clampPosition({
                         x: predictedPosition.x +
                             (limited.target.x - predictedPosition.x) * effectiveAlpha,

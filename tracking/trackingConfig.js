@@ -111,13 +111,18 @@ exports.DEFAULT_TRACKING_CONFIG = {
     verticalSeparationSearchStepMeters: 0.15,
     verticalSeparationPriorSigmaMeters: 0.60,
     verticalSeparationPriorWeight: 0.30,
-    // Minew E8 accelerometer / motion awareness. A fresh ACC frame is treated
-    // as direct movement evidence. After ACC movement stops arriving for this
-    // timeout, the tag becomes stationary. If ACC is not available, V14 falls
-    // back to the existing tracking estimate and labels it accordingly.
+    // Collar activity is not translation. Confirm coherent RF displacement
+    // across distinct multi-gateway frames before releasing a stationary marker.
     motionEvidenceFreshMs: 1800,
     motionStationaryAfterMs: 2600,
     motionTrackingSpeedThresholdMps: 0.16,
+    motionStartDistanceMeters: 0.45,
+    motionContinueDistanceMeters: 0.22,
+    motionRelativeRssiThresholdDb: 1.5,
+    motionTranslationFrames: 2,
+    motionTranslationMinSpanMs: 180,
+    motionMinimumPositionQuality: 0.02,
+    motionStopHoldMs: 1200,
     // Time-align asynchronous MG4 rows only by a small, bounded amount. This is
     // most useful while moving; it is deliberately conservative so noisy RSSI
     // velocity cannot create large synthetic signal changes.
