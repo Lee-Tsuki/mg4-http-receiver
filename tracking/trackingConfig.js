@@ -10,7 +10,7 @@ exports.DEFAULT_TRACKING_CONFIG = {
     maxReadingAgeMs: 4500,
     minimumRssi: -100,
     // Fresh gateways dominate stale/asynchronous rows gradually.
-    freshnessHalfLifeMs: 750,
+    freshnessHalfLifeMs: 1000,
     minimumFreshnessWeight: 0.05,
     // Use every RSSI sample in raw_payload as one statistical batch. MAD + IQR
     // + trimmed statistics resist impulsive RF noise, multipath, body blocking,
@@ -37,7 +37,7 @@ exports.DEFAULT_TRACKING_CONFIG = {
     // measurement frame around the newest row. The slightly wider window reduces
     // avoidable waiting between asynchronous MG4 uploads while freshness weights
     // keep older rows from dominating the fix.
-    measurementFrameWindowMs: 1500,
+    measurementFrameWindowMs: 2150,
     minimumFrameGateways: 3,
     minimumFrameCoverageRatio: 0.40,
     // Keep a conservative continuity mode for weak-coverage areas. Full-quality
@@ -111,18 +111,18 @@ exports.DEFAULT_TRACKING_CONFIG = {
     verticalSeparationSearchStepMeters: 0.15,
     verticalSeparationPriorSigmaMeters: 0.60,
     verticalSeparationPriorWeight: 0.30,
-    // Collar activity is not translation. Confirm coherent RF displacement
-    // across distinct multi-gateway frames before releasing a stationary marker.
-    motionEvidenceFreshMs: 1800,
+    // Collar motion is not translation. Require progressive displacement and
+    // multiple changed RF paths across fresh gateway frames before unlocking.
+    motionEvidenceFreshMs: 2500,
     motionStationaryAfterMs: 2600,
     motionTrackingSpeedThresholdMps: 0.16,
-    motionStartDistanceMeters: 0.45,
-    motionContinueDistanceMeters: 0.22,
-    motionRelativeRssiThresholdDb: 1.5,
+    motionStartDistanceMeters: 0.72,
+    motionContinueDistanceMeters: 0.28,
+    motionRelativeRssiThresholdDb: 3.2,
     motionTranslationFrames: 2,
-    motionTranslationMinSpanMs: 180,
+    motionTranslationMinSpanMs: 650,
     motionMinimumPositionQuality: 0.02,
-    motionStopHoldMs: 1200,
+    motionStopHoldMs: 950,
     // Time-align asynchronous MG4 rows only by a small, bounded amount. This is
     // most useful while moving; it is deliberately conservative so noisy RSSI
     // velocity cannot create large synthetic signal changes.
@@ -138,7 +138,7 @@ exports.DEFAULT_TRACKING_CONFIG = {
     // A moving posterior needs support beyond a compact stationary cluster:
     // 0.60 m per-axis spread covers roughly a 1.2 m axial step at two sigma.
     // This is uncertainty, not commanded motion; RF likelihood chooses X/Y.
-    particleMovingProcessNoiseMeters: 0.78,
+    particleMovingProcessNoiseMeters: 0.62,
     particleUnknownProcessNoiseMeters: 0.16,
     particleObservationSigmaFloorMeters: 0.50,
     particleResampleThreshold: 0.52,
@@ -161,7 +161,7 @@ exports.DEFAULT_TRACKING_CONFIG = {
     movingPositionDeadbandScale: 0.08,
     positionDeadbandRatio: 0.016,
     adaptiveDeadbandNoiseScale: 1.35,
-    positionDeadbandMaxMeters: 0.45,
+    positionDeadbandMaxMeters: 0.38,
     maxPositionSpeedMps: 4.2,
     maxPositionStepRatio: 0.14,
     velocitySmoothing: 0.30,

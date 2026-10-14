@@ -40,10 +40,21 @@ function updateMotionTracking({ readings, previous, now, config, trackingStation
     }
     const o = observation;
     const rows = o.gateways.filter(g => Number.isFinite(g.rssi) && Number.isFinite(g.timestamp));
-    if (rows.length < 3 && !prior.translation)
-        return next;
     const anchor = prior.translation;
+    // A two-gateway observation can preserve a weak-coverage position, but it
+    // cannot start a reliable new 2D translation. This protects stationary pets
+    // against a single reflected path or a briefly missing MG4 gateway.
+    if (rows.length < 3) {
+        if (prior.state === 'moving' && prior.translation &&
+            now - prior.translation.lastProgressAt > config.motionStopHoldMs) {
+            return { ...next, state: 'stationary', source: 'tracking', confidence: 0.55 };
+        }
+        return next;
+    }
     const freshCount = rows.filter(g => g.timestamp > (anchor?.seen[g.mac] ?? -Infinity)).length;
+    // Gateways arrive asynchronously; accumulate at least two *new* paths
+    // between candidate decisions, rather than requiring simultaneous uploads.
+    const moving = prior.state === 'moving';
     if (freshCount < 2)
         return next;
     const seen = Object.fromEntries(rows.map(g => [g.mac, g.timestamp]));
@@ -58,30 +69,62 @@ function updateMotionTracking({ readings, previous, now, config, trackingStation
     const distance = Math.hypot(dx, dy);
     const changes = rows.filter(g => Number.isFinite(anchor.baseline[g.mac]))
         .map(g => g.rssi - anchor.baseline[g.mac]);
-    // Median common-mode removal rejects global attenuation AND a single bad path.
+    // A common shift can be caused by body shadowing, orientation or moving
+    // people even while the beacon is stationary. Require multiple independent
+    // paths to change RELATIVE to their common-mode shift.
     const common = changes.length ? median(changes) : 0;
-    const moving = prior.state === 'moving';
-    const relativeThreshold = moving ? Math.min(0.4, config.motionRelativeRssiThresholdDb) : config.motionRelativeRssiThresholdDb;
+    const recentAccelerometerActivity = next.lastAccelerometerMotionAt !== null &&
+        Math.abs(o.timestamp - next.lastAccelerometerMotionAt) <= config.motionEvidenceFreshMs;
+    // ACC can speed up confirmed travel but can never release the anchor by
+    // itself: a dangling/swaying collar also produces accelerometer activity.
+    const relativeThreshold = moving
+        ? Math.max(1.7, config.motionRelativeRssiThresholdDb * 0.6)
+        : recentAccelerometerActivity
+            ? Math.max(3.0, config.motionRelativeRssiThresholdDb * 0.94)
+            : config.motionRelativeRssiThresholdDb;
     const changedPaths = changes.filter(delta => Math.abs(delta - common) >= relativeThreshold).length;
-    const threshold = moving ? config.motionContinueDistanceMeters : config.motionStartDistanceMeters;
+    const threshold = moving
+        ? config.motionContinueDistanceMeters
+        : recentAccelerometerActivity
+            ? Math.min(config.motionStartDistanceMeters, 0.62)
+            : config.motionStartDistanceMeters;
     const supportsTravel = distance >= threshold && changedPaths >= 2;
     const translation = { ...anchor, seen, timestamp: o.timestamp };
     if (supportsTravel) {
         const old = anchor.candidate;
-        const norm = old ? Math.hypot(old.dx, old.dy) * distance : 0;
-        const consistent = Boolean(old && norm > 0 && (old.dx * dx + old.dy * dy) / norm >= 0.65 &&
+        const oldDistance = old ? Math.hypot(old.dx, old.dy) : 0;
+        const directionConsistency = old && oldDistance > 0 && distance > 0
+            ? (old.dx * dx + old.dy * dy) / (oldDistance * distance)
+            : 0;
+        // Repeating an identical displaced estimate is not proof of walking.
+        // To confirm travel, the marker estimate must make new forward progress
+        // away from its stationary anchor on independent multi-gateway frames.
+        const forwardProgress = old
+            ? (old.dx * (dx - old.dx) + old.dy * (dy - old.dy)) /
+                Math.max(0.01, oldDistance)
+            : 0;
+        const consistent = Boolean(old && directionConsistency >= 0.72 &&
             o.timestamp - old.startedAt <= config.motionEvidenceFreshMs * 2);
+        const minimumProgress = 0.18;
+        const progressed = forwardProgress >= minimumProgress &&
+            distance >= oldDistance + minimumProgress * 0.66;
         const candidate = consistent && old
-            ? { ...old, count: old.count + 1, dx, dy }
+            ? progressed
+                ? { ...old, count: old.count + 1, dx, dy }
+                : { ...old } // keep first candidate; do not count stationary repeats
             : { dx, dy, count: 1, startedAt: o.timestamp };
-        const confirmed = moving || (candidate.count >= config.motionTranslationFrames &&
-            o.timestamp - candidate.startedAt >= config.motionTranslationMinSpanMs);
+        const requiredFrames = recentAccelerometerActivity ? Math.max(3, config.motionTranslationFrames) : config.motionTranslationFrames;
+        const confirmed = moving || (candidate.count >= requiredFrames &&
+            o.timestamp - candidate.startedAt >=
+                (recentAccelerometerActivity
+                    ? config.motionTranslationMinSpanMs
+                    : config.motionTranslationMinSpanMs));
         if (confirmed) {
-            return { ...next, state: 'moving', source: 'tracking', confidence: 0.80,
+            return { ...next, state: 'moving', source: 'tracking', confidence: 0.82,
                 translation: { ...translation, xMeters: o.xMeters, yMeters: o.yMeters,
                     baseline, lastProgressAt: o.timestamp, candidate: null } };
         }
-        return { ...next, state: 'stationary', source: 'tracking', confidence: 0.65,
+        return { ...next, state: 'stationary', source: 'tracking', confidence: 0.72,
             translation: { ...translation, candidate } };
     }
     if (moving && o.timestamp - anchor.lastProgressAt < config.motionStopHoldMs) {
