@@ -10,7 +10,7 @@ exports.DEFAULT_TRACKING_CONFIG = {
     maxReadingAgeMs: 4500,
     minimumRssi: -100,
     // Fresh gateways dominate stale/asynchronous rows gradually.
-    freshnessHalfLifeMs: 1000,
+    freshnessHalfLifeMs: 850,
     minimumFreshnessWeight: 0.05,
     // Use every RSSI sample in raw_payload as one statistical batch. MAD + IQR
     // + trimmed statistics resist impulsive RF noise, multipath, body blocking,
@@ -37,7 +37,7 @@ exports.DEFAULT_TRACKING_CONFIG = {
     // measurement frame around the newest row. The slightly wider window reduces
     // avoidable waiting between asynchronous MG4 uploads while freshness weights
     // keep older rows from dominating the fix.
-    measurementFrameWindowMs: 2150,
+    measurementFrameWindowMs: 1750,
     minimumFrameGateways: 3,
     minimumFrameCoverageRatio: 0.40,
     // Keep a conservative continuity mode for weak-coverage areas. Full-quality
@@ -113,14 +113,14 @@ exports.DEFAULT_TRACKING_CONFIG = {
     verticalSeparationPriorWeight: 0.30,
     // Collar motion is not translation. Require progressive displacement and
     // multiple changed RF paths across fresh gateway frames before unlocking.
-    motionEvidenceFreshMs: 2500,
+    motionEvidenceFreshMs: 2100,
     motionStationaryAfterMs: 2600,
     motionTrackingSpeedThresholdMps: 0.16,
-    motionStartDistanceMeters: 0.72,
+    motionStartDistanceMeters: 0.66,
     motionContinueDistanceMeters: 0.28,
-    motionRelativeRssiThresholdDb: 3.2,
+    motionRelativeRssiThresholdDb: 3.0,
     motionTranslationFrames: 2,
-    motionTranslationMinSpanMs: 650,
+    motionTranslationMinSpanMs: 400,
     motionMinimumPositionQuality: 0.02,
     motionStopHoldMs: 950,
     // Time-align asynchronous MG4 rows only by a small, bounded amount. This is
@@ -138,7 +138,7 @@ exports.DEFAULT_TRACKING_CONFIG = {
     // A moving posterior needs support beyond a compact stationary cluster:
     // 0.60 m per-axis spread covers roughly a 1.2 m axial step at two sigma.
     // This is uncertainty, not commanded motion; RF likelihood chooses X/Y.
-    particleMovingProcessNoiseMeters: 0.62,
+    particleMovingProcessNoiseMeters: 0.56,
     particleUnknownProcessNoiseMeters: 0.16,
     particleObservationSigmaFloorMeters: 0.50,
     particleResampleThreshold: 0.52,
@@ -156,7 +156,7 @@ exports.DEFAULT_TRACKING_CONFIG = {
     positionSmoothingAlpha: 0.27,
     // RF packet rejection and the particle posterior already filter movement.
     // Avoid rejecting A,A,A,A,B as an outlier after the ACC reports movement.
-    movingPositionSmoothingAlpha: 0.88,
+    movingPositionSmoothingAlpha: 0.85,
     movingPositionHistorySize: 1,
     movingPositionDeadbandScale: 0.08,
     positionDeadbandRatio: 0.016,
@@ -175,7 +175,7 @@ exports.DEFAULT_TRACKING_CONFIG = {
     stationaryClusterRadiusRatio: 0.045,
     stationaryExitRadiusRatio: 0.09,
     stationaryClusterRadiusMaxMeters: 0.55,
-    stationaryExitRadiusMaxMeters: 1.10,
+    stationaryExitRadiusMaxMeters: 0.95,
     stationaryReadingsRequired: 3,
     movementReadingsRequired: 2,
 };

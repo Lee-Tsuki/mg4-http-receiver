@@ -83,12 +83,24 @@ function updateMotionTracking({ readings, previous, now, config, trackingStation
             ? Math.max(3.0, config.motionRelativeRssiThresholdDb * 0.94)
             : config.motionRelativeRssiThresholdDb;
     const changedPaths = changes.filter(delta => Math.abs(delta - common) >= relativeThreshold).length;
+    // With exactly three fresh gateways, two paths can change together while
+    // the third moves oppositely. Their median then makes a genuine walk appear
+    // as only one changed relative path. Allow this limited-coverage case only
+    // when the E8 reports recent activity AND the measured RF/position evidence
+    // is strong; the normal progressive-direction check still applies below.
+    const threeGatewayMotionCandidate = rows.length === 3 &&
+        recentAccelerometerActivity && o.quality >= 0.10 &&
+        changedPaths >= 1 &&
+        changes.some(delta => Math.abs(delta - common) >= relativeThreshold * 1.65);
     const threshold = moving
         ? config.motionContinueDistanceMeters
         : recentAccelerometerActivity
             ? Math.min(config.motionStartDistanceMeters, 0.62)
             : config.motionStartDistanceMeters;
-    const supportsTravel = distance >= threshold && changedPaths >= 2;
+    const supportsTravel = distance >= threshold &&
+        (changedPaths >= 2 ||
+            (threeGatewayMotionCandidate &&
+                distance >= (moving ? threshold : Math.max(0.9, threshold))));
     const translation = { ...anchor, seen, timestamp: o.timestamp };
     if (supportsTravel) {
         const old = anchor.candidate;
