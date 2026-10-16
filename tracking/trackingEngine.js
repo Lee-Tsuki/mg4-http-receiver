@@ -619,17 +619,42 @@ function calculateTrackingResult({ readings, gateways, zones, memory, config = t
                 ? Math.max(1, mergedConfig.sparseConfidenceExpansion)
                 : 1)
         : null;
-    // Use the unsmoothed calibrated estimate for travel evidence. Looking at
-    // displayed velocity here would create a stationary-lock feedback loop.
+    // Motion confirmation must not wait for the temporal RSSI Kalman filter to
+    // catch up. Favor robust per-packet iBeacon centers for this independent RF
+    // opinion; the displayed position still uses the existing filtered solver,
+    // particle posterior, speed limits and smoothing below. ACC alone never
+    // provides a position or releases the stationary lock.
+    const motionEstimate = hasNewSourceData && calibratedGateway && frame.ready
+        ? (0, locationEngine_1.calculatePositionEstimate)(
+            frame.readings.map(row => ({
+                ...row,
+                // Retain some temporal damping so one noisy packet cannot dominate
+                // the travel opinion, while giving the newest batch most authority.
+                rssi: (row.packet_rssi ?? row.rssi) * 0.7 + row.rssi * 0.3,
+                filtered_rssi: (row.packet_rssi ?? row.rssi) * 0.7 + row.rssi * 0.3,
+            })),
+            gateways,
+            mergedConfig,
+            {
+                previousPosition:
+                    previousSourceTimestamp === null ? null : previousPosition,
+                elapsedSeconds: elapsedSecondsForEstimate,
+                calibrationProfile: effectiveCalibrationProfile,
+            },
+        )
+        : estimate;
+
+    // Looking at displayed velocity here would create a stationary-lock loop.
     motionTracking = (0, motionEngine_1.updateMotionTracking)({
         readings, previous: memory.state.motionTracking, now, config: mergedConfig,
         trackingStationary: Boolean(memory.state.stationaryTracking?.isStationary),
         positionSpeedMetersPerSecond: physicalSpeedMetersPerSecond({ velocity: previousVelocity, calibratedGateway }),
         observation: hasNewSourceData && calibratedGateway && newestSourceTimestamp !== null
             ? {
-                xMeters: estimate.position.x / 100 * calibratedGateway.mapWidthMeters,
-                yMeters: estimate.position.y / 100 * calibratedGateway.mapHeightMeters,
-                timestamp: newestSourceTimestamp, quality: effectivePositionQuality,
+                xMeters: motionEstimate.position.x / 100 * calibratedGateway.mapWidthMeters,
+                yMeters: motionEstimate.position.y / 100 * calibratedGateway.mapHeightMeters,
+                timestamp: newestSourceTimestamp,
+                quality: Math.min(effectivePositionQuality, motionEstimate.quality),
                 gateways: frame.readings.map(row => ({ mac: row.gateway_mac,
                     timestamp: row.source_timestamp, rssi: row.packet_rssi ?? row.rssi })),
             }

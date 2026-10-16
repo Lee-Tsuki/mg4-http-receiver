@@ -111,18 +111,19 @@ exports.DEFAULT_TRACKING_CONFIG = {
     verticalSeparationSearchStepMeters: 0.15,
     verticalSeparationPriorSigmaMeters: 0.60,
     verticalSeparationPriorWeight: 0.30,
-    // Collar motion is not translation. Require progressive displacement and
-    // multiple changed RF paths across fresh gateway frames before unlocking.
+    // Collar motion is not translation. Two independent RF frames must show
+    // progressive displacement; ACC only reduces the evidence thresholds.
     motionEvidenceFreshMs: 2100,
     motionStationaryAfterMs: 2600,
     motionTrackingSpeedThresholdMps: 0.16,
-    motionStartDistanceMeters: 0.66,
-    motionContinueDistanceMeters: 0.28,
-    motionRelativeRssiThresholdDb: 3.0,
+    motionStartDistanceMeters: 0.52,
+    motionContinueDistanceMeters: 0.22,
+    motionRelativeRssiThresholdDb: 2.0,
     motionTranslationFrames: 2,
     motionTranslationMinSpanMs: 400,
     motionMinimumPositionQuality: 0.02,
-    motionStopHoldMs: 950,
+    // Bridge asynchronous one-second gateway uploads during an established walk.
+    motionStopHoldMs: 2600,
     // Time-align asynchronous MG4 rows only by a small, bounded amount. This is
     // most useful while moving; it is deliberately conservative so noisy RSSI
     // velocity cannot create large synthetic signal changes.
